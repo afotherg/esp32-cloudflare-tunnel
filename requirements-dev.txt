@@ -1,0 +1,4 @@
+pycapnp==2.2.4
+pyserial==3.5
+cryptography>=43
+setuptools<81
