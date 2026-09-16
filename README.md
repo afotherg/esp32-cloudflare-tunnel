@@ -162,6 +162,19 @@ WebSockets, remote management logs, arbitrary origin proxying, or OTA updater.
 It exposes the telemetry through the access policy already configured for the
 tunnel; it does not add application authentication.
 
+### Cloudflare dashboard status: Degraded
+
+Expect this client to show **Degraded** in the Cloudflare dashboard even while
+the website and telemetry endpoints are working. Standard `cloudflared` maintains
+four redundant connections to Cloudflare; this ESP32 implementation maintains
+only **one** to limit memory usage. It therefore lacks the connection redundancy
+associated with Cloudflare's **Healthy** status.
+
+This status alone does not mean requests are failing. However, if the single
+connection drops, requests can fail until the ESP32 reconnects. The firmware
+reconnects automatically, but it has no second active connection to carry traffic
+during recovery. See [Cloudflare's tunnel status definitions](https://developers.cloudflare.com/tunnel/troubleshooting/).
+
 Protocol references:
 
 - [Cloudflare HTTP/2 connection implementation](https://github.com/cloudflare/cloudflared/blob/master/connection/http2.go)
