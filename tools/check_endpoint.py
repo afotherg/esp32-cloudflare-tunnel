@@ -17,11 +17,17 @@ def fetch(path='/api/telemetry', method='GET'):
                                  headers={'User-Agent': 'ESP32-Telemetry-Check/1.0'})
     with urllib.request.urlopen(req, timeout=20) as res:
         assert res.status == 200
-        assert 'application/json' in res.headers['Content-Type']
+        assert ('text/html' if path == '/' else 'application/json') in res.headers['Content-Type']
         assert res.headers.get('Cache-Control') == 'no-store'
-        return json.load(res) if method != 'HEAD' else res.read()
+        if method == 'HEAD' or path == '/':
+            return res.read()
+        return json.load(res)
 
-first = fetch('/')
+page = fetch('/')
+assert b'Inside the chip.' in page and b"fetch('/api/telemetry'" in page
+assert fetch('/', method='HEAD') == b''
+assert fetch('/healthz')['chip'] == 'ESP32-S3'
+first = fetch()
 assert first['chip'] == 'ESP32-S3'
 assert first['tunnel_connected'] is True
 assert first['heap_free_bytes'] > 0
@@ -40,4 +46,4 @@ assert min(r['uptime_seconds'] for r in rows) >= first['uptime_seconds']
 assert max(r['requests_served'] for r in rows) > first['requests_served']
 assert all(r['reconnections'] == first['reconnections'] for r in rows)
 print(json.dumps(rows[-1], indent=2))
-print(f'PASS: live telemetry, HEAD, 404, 405, and {args.requests} concurrent requests')
+print(f'PASS: HTML dashboard, both JSON endpoints, HEAD, 404, 405, and {args.requests} concurrent requests')

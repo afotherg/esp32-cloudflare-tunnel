@@ -1,7 +1,7 @@
 # Native Cloudflare Tunnel on ESP32-S3
 
 This firmware connects the Heltec WiFi LoRa 32 V3 directly to Cloudflare and
-returns live device telemetry as JSON. The computer is used to flash and inspect
+serves a live dashboard and device telemetry as JSON. The computer is used to flash and inspect
 the board; it does not run `cloudflared`, a proxy, or a telemetry relay.
 
 ```
@@ -15,7 +15,13 @@ TCP connection on the microcontroller.
 
 ## Endpoints
 
-`GET /`, `GET /api/telemetry`, and `GET /healthz` return JSON with:
+`GET /` serves the self-contained dashboard, with live metric cards, temperature
+and allocated-memory charts, memory allocation, and device details. It polls
+every five seconds, pauses when hidden, backs off on failures, and labels stale
+readings. Chart history is held only in the browser for a five-minute window.
+The page uses no external fonts, scripts, or images.
+
+`GET /api/telemetry` and `GET /healthz` return JSON with:
 
 - Internal chip temperature in Celsius (not ambient temperature).
 - Allocated, free, minimum free, and largest contiguous internal heap sizes.
@@ -27,14 +33,37 @@ return 405. Responses use `Cache-Control: no-store`. `/healthz` returns the same
 telemetry, including tunnel state. A missing/failed temperature reading is `null`.
 Heap metrics refer to allocatable internal 8-bit heap, not all physical RAM.
 
+Edit `web/dashboard.html` to change the dashboard. The PlatformIO pre-build step
+embeds it into a generated `src/dashboard_asset.hpp`; this generated file is
+ignored. The tunnel streams the page directly from flash rather than allocating
+a full HTML copy per request. Credentials remain entirely separate from the page.
+
+## OLED request display
+
+The onboard 128×64 OLED displays the latest request date, time in the
+America/Los_Angeles time zone (PST/PDT), and client IPv4 or IPv6 address. All
+tunnel HTTP requests update it, including the dashboard's five-second telemetry
+polls. Internal tunnel control/configuration traffic does not update it.
+The display preserves the request timestamp rather than advancing like a clock.
+
+Tunnel requests use Cloudflare's `CF-Connecting-IP`, including its serialized
+header representation; local requests use the TCP peer address. Missing IPs and
+unsynchronized time are labeled explicitly. Client IPs are shown only on the
+physical OLED, not added to the public telemetry response. `oled_ready` and
+`oled_updates` provide non-identifying display diagnostics in telemetry.
+
+The SSD1306 uses SDA 17, SCL 18, reset 21, and active-low Vext 36 on the Heltec V3.
+A separate task coalesces bursts to the latest request and bounds display I/O,
+so network handling does not wait for OLED transfers.
+
 ## Build
 
 The tested toolchain is PlatformIO Espressif32 5.4.0 with ESP-IDF 4.4.5. It is
 pinned in `platformio.ini` and uses the locally available ESP32-S3 toolchain.
 
 ```sh
-cd /Users/alan/codex/ESP32/cloudflare_client
-/Users/alan/Library/Python/3.12/bin/pio run
+cd esp32-cloudflare-tunnel
+pio run
 ```
 
 ## Provision credentials

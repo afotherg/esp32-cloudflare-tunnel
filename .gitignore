@@ -6,3 +6,4 @@ sdkconfig.heltec_wifi_lora_32_v3
 __pycache__/
 tests/build/
 credentials.json
+src/dashboard_asset.hpp

@@ -1,5 +1,6 @@
 #include "../certs/cloudflare_origin_ca.hpp"
 #include "cJSON.h"
+#include "dashboard_asset.hpp"
 #include "driver/temp_sensor.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -22,6 +23,7 @@
 #include "nghttp2/nghttp2.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "request_display.hpp"
 #include "rpc.hpp"
 #include <algorithm>
 #include <atomic>
@@ -72,6 +74,44 @@ static std::string nvsString(nvs_handle_t n, const char *key) {
     return out;
 }
 static rpc::Credentials credentials;
+static bool validIp(const std::string &ip) {
+    uint8_t address[16];
+    return inet_pton(AF_INET, ip.c_str(), address) == 1 ||
+           inet_pton(AF_INET6, ip.c_str(), address) == 1;
+}
+static std::string requestIp(const std::string &serialized) {
+    // Cloudflare's negotiated serialized_headers feature encodes each name/value
+    // using unpadded base64. CF-Connecting-IP is set by the trusted edge.
+    size_t start = 0;
+    while (start < serialized.size()) {
+        size_t end = serialized.find(';', start);
+        if (end == std::string::npos)
+            end = serialized.size();
+        size_t colon = serialized.find(':', start);
+        if (colon < end) {
+            auto decode = [](std::string value) {
+                while (value.size() % 4)
+                    value += '=';
+                auto raw = decode64(value);
+                return std::string(raw.begin(), raw.end());
+            };
+            try {
+                std::string name = decode(serialized.substr(start, colon - start));
+                std::transform(name.begin(), name.end(), name.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (name == "cf-connecting-ip") {
+                    auto ip = decode(serialized.substr(colon + 1, end - colon - 1));
+                    if (validIp(ip))
+                        return ip;
+                }
+            } catch (...) {
+                return {};
+            }
+        }
+        start = end + 1;
+    }
+    return {};
+}
 static std::string telemetry() {
     Json j(cJSON_CreateObject(), cJSON_Delete);
     esp_chip_info_t chip;
@@ -110,12 +150,32 @@ static std::string telemetry() {
     cJSON_AddNumberToObject(j.get(), "requests_served", requests);
     cJSON_AddNumberToObject(j.get(), "reconnections", reconnects);
     cJSON_AddNumberToObject(j.get(), "reset_reason", esp_reset_reason());
+    cJSON_AddBoolToObject(j.get(), "oled_ready", requestDisplayHealthy());
+    cJSON_AddNumberToObject(j.get(), "oled_updates", requestDisplayUpdates());
     cJSON_AddStringToObject(j.get(), "sdk_version", esp_get_idf_version());
     return stringify(j.get());
 }
 static esp_err_t localHandler(httpd_req_t *r) {
     try {
+        sockaddr_storage peer{};
+        socklen_t length = sizeof(peer);
+        char address[46]{};
+        if (getpeername(httpd_req_to_sockfd(r), reinterpret_cast<sockaddr *>(&peer), &length) ==
+            0) {
+            if (peer.ss_family == AF_INET)
+                inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in *>(&peer)->sin_addr, address,
+                          sizeof(address));
+            else if (peer.ss_family == AF_INET6)
+                inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6 *>(&peer)->sin6_addr, address,
+                          sizeof(address));
+        }
+        requestDisplayRecord(address);
         ++requests;
+        if (std::string(r->uri).substr(0, std::string(r->uri).find('?')) == "/") {
+            httpd_resp_set_type(r, "text/html; charset=utf-8");
+            httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+            return httpd_resp_send(r, DASHBOARD_HTML, sizeof(DASHBOARD_HTML) - 1);
+        }
         auto body = telemetry();
         httpd_resp_set_type(r, "application/json");
         httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -125,7 +185,9 @@ static esp_err_t localHandler(httpd_req_t *r) {
     }
 }
 struct Stream {
-    std::string method, path, host, upgrade, input, output;
+    std::string method, path, host, upgrade, input, output, clientIp;
+    const char *staticBody = nullptr;
+    size_t staticLength = 0;
     size_t offset = 0, headerBytes = 0;
     bool control = false, responded = false;
 };
@@ -155,11 +217,13 @@ class Tunnel {
         if (it == t.streams.end())
             return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
         auto &s = it->second;
-        size_t n = std::min(len, s.output.size() - s.offset);
+        const size_t size = s.staticBody ? s.staticLength : s.output.size();
+        const char *body = s.staticBody ? s.staticBody : s.output.data();
+        size_t n = std::min(len, size - s.offset);
         if (n)
-            memcpy(buf, s.output.data() + s.offset, n);
+            memcpy(buf, body + s.offset, n);
         s.offset += n;
-        if (s.offset == s.output.size()) {
+        if (s.offset == size) {
             if (!s.control)
                 *flags |= NGHTTP2_DATA_FLAG_EOF;
             else if (n == 0)
@@ -167,16 +231,20 @@ class Tunnel {
         }
         return n;
     }
-    void respond(int32_t id, const std::string &body, const char *status = "200",
-                 bool head = false) {
+    void respond(int32_t id, const std::string &body, const char *status = "200", bool head = false,
+                 bool html = false) {
         auto &s = streams.at(id);
         s.responded = true;
         s.output = head ? "" : body;
+        s.staticBody = html && !head ? DASHBOARD_HTML : nullptr;
+        s.staticLength = html && !head ? sizeof(DASHBOARD_HTML) - 1 : 0;
         s.offset = 0;
         auto headers = std::vector<nghttp2_nv>{
             nv(":status", status), nv("cf-cloudflared-response-meta", "{\"src\":\"origin\"}"),
             nv("cf-cloudflared-response-headers",
-               "Q29udGVudC1UeXBl:YXBwbGljYXRpb24vanNvbg;Q2FjaGUtQ29udHJvbA:bm8tc3RvcmU")};
+               html ? "Q29udGVudC1UeXBl:dGV4dC9odG1sOyBjaGFyc2V0PXV0Zi04;Q2FjaGUtQ29udHJvbA:"
+                      "bm8tc3RvcmU"
+                    : "Q29udGVudC1UeXBl:YXBwbGljYXRpb24vanNvbg;Q2FjaGUtQ29udHJvbA:bm8tc3RvcmU")};
         nghttp2_data_provider provider{};
         provider.read_callback = readData;
         if (nghttp2_submit_response(h2, id, headers.data(), headers.size(), &provider) != 0)
@@ -220,6 +288,13 @@ class Tunnel {
             s.host = v;
         else if (key == "cf-cloudflared-proxy-connection-upgrade")
             s.upgrade = v;
+        else if (key == "cf-connecting-ip" && validIp(v))
+            s.clientIp = v;
+        else if (key == "cf-cloudflared-request-headers") {
+            auto ip = requestIp(v);
+            if (!ip.empty())
+                s.clientIp = ip;
+        }
         return 0;
     }
     void configuration(int32_t id) {
@@ -288,6 +363,8 @@ class Tunnel {
         auto &s = it->second;
         try {
             if (f->hd.type == NGHTTP2_HEADERS && !s.responded) {
+                if (s.upgrade.empty())
+                    requestDisplayRecord(s.clientIp.c_str());
                 if (s.upgrade == "control-stream") {
                     if (t.controlId)
                         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
@@ -314,7 +391,8 @@ class Tunnel {
                                   s.method == "HEAD");
                     else {
                         ++requests;
-                        t.respond(f->hd.stream_id, telemetry(), "200", s.method == "HEAD");
+                        t.respond(f->hd.stream_id, path == "/" ? "" : telemetry(), "200",
+                                  s.method == "HEAD", path == "/");
                     }
                 }
             }
@@ -471,6 +549,9 @@ static void wifiEvent(void *, esp_event_base_t base, int32_t id, void *arg) {
     }
 }
 extern "C" void app_main() {
+    setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+    tzset();
+    requestDisplayInit();
     // Never erase NVS automatically: it contains the provisioned tunnel credentials.
     ESP_ERROR_CHECK(nvs_flash_init());
     nvs_handle_t nvs;
