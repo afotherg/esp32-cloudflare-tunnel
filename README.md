@@ -59,9 +59,12 @@ so network handling does not wait for OLED transfers.
 ## Build
 
 The tested toolchain is PlatformIO Espressif32 5.4.0 with ESP-IDF 4.4.5. It is
-pinned in `platformio.ini` and uses the locally available ESP32-S3 toolchain.
+pinned in `platformio.ini`; PlatformIO installs the required ESP32-S3 toolchain.
+Install PlatformIO Core, clone this repository, and run the commands below from
+the repository directory on the computer connected to the board.
 
 ```sh
+git clone https://github.com/afotherg/esp32-cloudflare-tunnel.git
 cd esp32-cloudflare-tunnel
 pio run
 ```
@@ -76,9 +79,14 @@ not enable flash encryption or secure boot.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python tools/provision.py
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt "esptool>=4.8,<5"
+python tools/provision.py
 ```
+
+These examples use a macOS/Linux shell with the virtual environment activated.
+On Windows, activate `.venv\Scripts\Activate.ps1` in PowerShell and adapt shell
+variables and line continuations accordingly.
 
 The provisioning tool prompts for Wi-Fi SSID, password, and tunnel token.
 Alternatively, pass `--credentials /private/path/credentials.json` containing
@@ -89,56 +97,101 @@ depth; the example is safe to commit.
 Updating the application alone preserves existing NVS. Flash `nvs.bin` only
 when provisioning or intentionally replacing credentials.
 
-## Flash the board on server
+## Flash a locally connected board
 
-SSH access is `user@server`; the board is `/dev/cu.usbserial-0001`. Use
-115200 baud on this connection: a 460800-baud full flash read encountered serial
-corruption. Close serial monitors before flashing.
+Connect the Heltec V3 directly to your computer with a USB data cable. All
+commands below run on that computer; no SSH connection or second machine is
+needed. Close serial monitors before backing up, flashing, or restoring flash.
 
-Back up the current flash before replacing it:
+Find the board's serial port:
 
 ```sh
-ssh user@server 'mkdir -p ~/esp32-cloudflare/backups; chmod 700 ~/esp32-cloudflare'
-ssh user@server 'python3 -m esptool --chip esp32s3 --port /dev/cu.usbserial-0001 --baud 115200 read_flash 0 ALL ~/esp32-cloudflare/backups/before-cloudflare.bin'
+pio device list
 ```
 
-Do not overwrite an existing original backup when performing later updates.
-Copy the build and provisioning artifacts:
+Typical port names are `/dev/cu.usbserial-0001` or `/dev/cu.usbmodem…` on macOS,
+`/dev/ttyUSB0` or `/dev/ttyACM0` on Linux, and `COM3` on Windows. Use the port
+reported for **your board**, rather than copying an example unchanged. For the
+macOS/Linux commands below, set:
 
 ```sh
-scp .pio/build/heltec_wifi_lora_32_v3/{bootloader,partitions,firmware}.bin \
-    secrets/nvs.bin tools/monitor.py user@server:esp32-cloudflare/
-ssh user@server 'chmod 600 ~/esp32-cloudflare/nvs.bin'
-ssh user@server 'cd ~/esp32-cloudflare && python3 -m esptool --chip esp32s3 --port /dev/cu.usbserial-0001 --baud 115200 write_flash --flash_mode dio --flash_freq 80m --flash_size 8MB 0x0 bootloader.bin 0x8000 partitions.bin 0x9000 nvs.bin 0x10000 firmware.bin'
+ESP32_PORT=/dev/ttyUSB0
 ```
 
-For firmware-only updates, write only `0x10000 firmware.bin`. Read logs with:
+In PowerShell, assign `$ESP32_PORT = "COM3"` instead. The examples use 115200 baud
+for reliable transfers. Keep the virtual environment from provisioning active
+so `python -m esptool` uses the installed 4.x version.
+
+Back up the current flash before replacing it. Store backups under the ignored
+`secrets/` directory because they may contain credentials:
 
 ```sh
-ssh user@server 'python3 ~/esp32-cloudflare/monitor.py --seconds 60'
+mkdir -p secrets/backups
+umask 077
+ESP32_BACKUP="secrets/backups/before-cloudflare-$(date +%Y%m%d-%H%M%S).bin"
+python -m esptool --chip esp32s3 --port "$ESP32_PORT" --baud 115200 \
+    read_flash 0 ALL "$ESP32_BACKUP"
+```
+
+Keep that filename for recovery. Do not overwrite the original backup during
+later updates. On Windows, choose a unique filename under `secrets/backups`
+and restrict access to that directory using your operating system's permissions.
+
+Flash the bootloader, partition table, private provisioning image, and application
+directly from the local build directory:
+
+```sh
+python -m esptool --chip esp32s3 --port "$ESP32_PORT" --baud 115200 \
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 8MB \
+    0x0 .pio/build/heltec_wifi_lora_32_v3/bootloader.bin \
+    0x8000 .pio/build/heltec_wifi_lora_32_v3/partitions.bin \
+    0x9000 secrets/nvs.bin \
+    0x10000 .pio/build/heltec_wifi_lora_32_v3/firmware.bin
+```
+
+For subsequent firmware-only updates, rebuild and write only the application
+partition, preserving the stored Wi-Fi and tunnel credentials:
+
+```sh
+pio run
+python -m esptool --chip esp32s3 --port "$ESP32_PORT" --baud 115200 \
+    write_flash 0x10000 .pio/build/heltec_wifi_lora_32_v3/firmware.bin
+```
+
+Read startup logs from the same local serial port:
+
+```sh
+python tools/monitor.py --port "$ESP32_PORT" --seconds 60
 ```
 
 Successful startup logs show Wi-Fi connection, verified TLS, `TUNNEL REGISTERED`,
 and the hostname received through remote configuration. An NTP time sync is
 required before TLS certificate verification. Outbound TCP 7844 must be allowed.
+Once provisioned, the board needs power and Wi-Fi; the computer is not needed
+for serving the dashboard or maintaining the tunnel.
 
-To restore the original board state, write the saved full image at address 0:
+To restore the original board state, write the saved full image at address 0.
+If using a new terminal session, set `ESP32_PORT` and `ESP32_BACKUP` to your
+board's port and the existing backup filename first:
 
 ```sh
-ssh user@server 'python3 -m esptool --chip esp32s3 --port /dev/cu.usbserial-0001 --baud 115200 write_flash 0 ~/esp32-cloudflare/backups/before-cloudflare.bin'
+python -m esptool --chip esp32s3 --port "$ESP32_PORT" --baud 115200 \
+    write_flash 0 "$ESP32_BACKUP"
 ```
 
 ## Verification
 
-Compile the portable RPC codec with sanitizers and test against the actual
-Cap'n Proto schemas, including multiple segments and malformed pointers:
+With the virtual environment active, compile the portable RPC codec with
+sanitizers and test against the actual Cap'n Proto schemas, including multiple
+segments and malformed pointers. Replace `https://esp32.example.com` with the
+public hostname configured for your tunnel:
 
 ```sh
 mkdir -p tests/build
 c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I src \
     src/rpc.cpp tests/rpc_cli.cpp -o tests/build/rpc_cli
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python tools/check_endpoint.py https://esp32.fothergill.com
+python -m unittest discover -s tests -v
+python tools/check_endpoint.py https://esp32.example.com
 ```
 
 ## Protocol and scope
