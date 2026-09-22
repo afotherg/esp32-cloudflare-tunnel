@@ -145,7 +145,8 @@ Bytes bootstrap() {
     w.message(8, 1, 1);
     return w.frame();
 }
-Bytes registration(const Credentials &c) {
+Bytes registration(const Credentials &c, uint8_t connectionIndex) {
+    require(connectionIndex < 4);
     require(c.account.size() == 32 && !c.secret.empty() && c.secret.size() <= 128 &&
             c.tunnel.size() == 16 && c.client.size() == 16);
     Writer w;
@@ -157,6 +158,7 @@ Bytes registration(const Credentials &c) {
     w.structure(target + 1, 1, 1); // target bootstrap question 0, no transform
     size_t payload = w.structure(call + 4, 0, 2);
     size_t params = w.structure(payload, 1, 3);
+    w.put(params * 8, connectionIndex, 1);
     size_t auth = w.structure(params + 1, 0, 2);
     w.text(auth, c.account);
     w.bytes(auth + 1, c.secret);
@@ -165,7 +167,7 @@ Bytes registration(const Credentials &c) {
     size_t client = w.structure(opts + 1, 0, 4);
     w.bytes(client, c.client);
     w.texts(client + 1, {"allow_remote_config", "serialized_headers"});
-    w.text(client + 2, "esp32-native-0.1.0");
+    w.text(client + 2, "esp32-native-0.2.0");
     w.text(client + 3, "espidf_esp32s3");
     w.bytes(opts + 2, c.ip);
     return w.frame();

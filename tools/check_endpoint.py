@@ -9,6 +9,8 @@ import urllib.request
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('url')
 p.add_argument('--requests', type=int, default=12)
+p.add_argument('--connections', type=int, default=4)
+p.add_argument('--workers', type=int, default=4)
 args = p.parse_args()
 base = args.url.rstrip('/')
 
@@ -30,6 +32,8 @@ assert fetch('/healthz')['chip'] == 'ESP32-S3'
 first = fetch()
 assert first['chip'] == 'ESP32-S3'
 assert first['tunnel_connected'] is True
+assert first['tunnel_connections'] == args.connections
+assert first['tunnel_healthy'] == (args.connections == first['tunnel_connections_desired'])
 assert first['heap_free_bytes'] > 0
 assert first['heap_used_bytes'] > 0
 assert first['chip_temperature_c'] is None or -10 <= first['chip_temperature_c'] <= 80
@@ -40,10 +44,12 @@ for path, method, expected in [('/does-not-exist','GET',404),('/','POST',405)]:
         raise AssertionError('Expected HTTP error')
     except urllib.error.HTTPError as e:
         assert e.code == expected, (e.code, expected)
-with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
     rows = list(pool.map(lambda _: fetch(), range(args.requests)))
 assert min(r['uptime_seconds'] for r in rows) >= first['uptime_seconds']
 assert max(r['requests_served'] for r in rows) > first['requests_served']
 assert all(r['reconnections'] == first['reconnections'] for r in rows)
+assert all(r['tunnel_connections'] == args.connections for r in rows)
+assert all(0 <= r['served_by_connection'] < 4 for r in rows)
 print(json.dumps(rows[-1], indent=2))
-print(f'PASS: HTML dashboard, both JSON endpoints, HEAD, 404, 405, and {args.requests} concurrent requests')
+print(f'PASS: HTML dashboard, both JSON endpoints, HEAD, 404, 405, and {args.requests} requests ({args.workers} concurrent workers)')

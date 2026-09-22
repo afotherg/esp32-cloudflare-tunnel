@@ -69,6 +69,11 @@ cd esp32-cloudflare-tunnel
 pio run
 ```
 
+When upgrading an existing checkout from 0.1.0, remove the generated
+`sdkconfig.heltec_wifi_lora_32_v3` file and run `pio run -t clean` before
+`pio run`. This applies the new socket and TLS memory settings from
+`sdkconfig.defaults`. It does not change the credentials stored on the board.
+
 ## Provision credentials
 
 Credentials are stored in the NVS partition, separately from the firmware.
@@ -99,9 +104,8 @@ when provisioning or intentionally replacing credentials.
 
 ## Flash a locally connected board
 
-Connect the Heltec V3 directly to your computer with a USB data cable. All
-commands below run on that computer; no SSH connection or second machine is
-needed. Close serial monitors before backing up, flashing, or restoring flash.
+Connect the Heltec V3 to your computer with a USB data cable. Close serial
+monitors before backing up, flashing, or restoring flash.
 
 Find the board's serial port:
 
@@ -191,8 +195,17 @@ mkdir -p tests/build
 c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -I src \
     src/rpc.cpp tests/rpc_cli.cpp -o tests/build/rpc_cli
 python -m unittest discover -s tests -v
+c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -pthread -I src \
+    src/edge_dns.cpp tests/connection_cli.cpp -o tests/build/connection_cli
+tests/build/connection_cli
 python tools/check_endpoint.py https://esp32.example.com
 ```
+
+The four-connection build has been tested on a Heltec V3 without PSRAM with
+120 public requests using 12 concurrent clients, keeping all four connections
+registered throughout the run. The lowest free internal heap recorded since
+boot was approximately 69,000 bytes. This is a short hardware
+validation, not a long-term availability guarantee.
 
 ## Protocol and scope
 
@@ -210,23 +223,29 @@ stalled connections, with bounded exponential backoff and jitter on reconnect.
 Wi-Fi reconnects automatically.
 
 This is a focused telemetry connector, not a complete replacement for
-`cloudflared`. It runs one edge connection, with no QUIC, TCP forwarding,
+`cloudflared`. It maintains four edge connections, with no QUIC, TCP forwarding,
 WebSockets, remote management logs, arbitrary origin proxying, or OTA updater.
 It exposes the telemetry through the access policy already configured for the
 tunnel; it does not add application authentication.
 
-### Cloudflare dashboard status: Degraded
+### Cloudflare dashboard status
 
-Expect this client to show **Degraded** in the Cloudflare dashboard even while
-the website and telemetry endpoints are working. Standard `cloudflared` maintains
-four redundant connections to Cloudflare; this ESP32 implementation maintains
-only **one** to limit memory usage. It therefore lacks the connection redundancy
-associated with Cloudflare's **Healthy** status.
+Version 0.2.0 targets **Healthy** by registering four concurrent connections with
+indexes 0–3 under the same connector ID. It selects distinct edge addresses, with
+two connections to each Cloudflare region. Each connection reconnects independently;
+routing configuration is shared so requests can arrive over any connection.
 
-This status alone does not mean requests are failing. However, if the single
-connection drops, requests can fail until the ESP32 reconnects. The firmware
-reconnects automatically, but it has no second active connection to carry traffic
-during recovery. See [Cloudflare's tunnel status definitions](https://developers.cloudflare.com/tunnel/troubleshooting/).
+The dashboard shows the registered connection count. `/healthz` and
+`/api/telemetry` include `tunnel_connections`, `tunnel_connections_desired`,
+`tunnel_healthy`, and per-connection request/reconnect counters. `tunnel_connected`
+remains true while at least one connection is registered. These are the device's
+observations; Cloudflare's dashboard may take time to reflect a change.
+
+To fit four connections on the ESP32-S3 without PSRAM, TLS handshakes run one at a
+time, mbedTLS releases temporary handshake data and idle record buffers, and
+HTTP/2 response data frames are limited to 2 KiB. Certificate validation remains
+enabled for every connection. Four connections on one board do not protect
+against loss of power or Wi-Fi to that board.
 
 Protocol references:
 

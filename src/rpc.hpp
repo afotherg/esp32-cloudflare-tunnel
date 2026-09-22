@@ -10,7 +10,7 @@ struct Credentials {
     Bytes secret, tunnel, client, ip;
 };
 Bytes bootstrap();
-Bytes registration(const Credentials &credentials);
+Bytes registration(const Credentials &credentials, uint8_t connectionIndex = 0);
 Bytes finish(uint32_t question);
 // 0 means incomplete. Throws on malformed or oversized input.
 size_t frameSize(const Bytes &bytes);

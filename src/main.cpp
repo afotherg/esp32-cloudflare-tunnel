@@ -1,7 +1,9 @@
 #include "../certs/cloudflare_origin_ca.hpp"
 #include "cJSON.h"
+#include "connection_state.hpp"
 #include "dashboard_asset.hpp"
 #include "driver/temp_sensor.h"
+#include "edge_dns.hpp"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -26,18 +28,31 @@
 #include "request_display.hpp"
 #include "rpc.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <ctime>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 
 static constexpr char TAG[] = "tunnel";
 static EventGroupHandle_t events;
 static esp_netif_t *netif;
-static std::atomic<bool> connected{false};
+static ConnectionState connections;
+static std::atomic<unsigned> wifiGeneration{0};
+static std::mutex handshakeMutex, routesMutex, temperatureMutex;
+struct Route {
+    std::string host, service;
+};
+static std::vector<Route> routes;
+static int appliedVersion = -1;
+static std::array<std::string, ConnectionState::desired> edgeAddresses;
+static std::atomic<unsigned> connectionRequests[ConnectionState::desired]{};
+static std::atomic<unsigned> connectionRetries[ConnectionState::desired]{};
+static std::atomic<unsigned> stackFree[ConnectionState::desired]{};
 static std::atomic<unsigned> requests{0}, reconnects{0};
 static bool temperatureReady = false;
 using Json = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
@@ -112,7 +127,7 @@ static std::string requestIp(const std::string &serialized) {
     }
     return {};
 }
-static std::string telemetry() {
+static std::string telemetry(int connectionIndex = -1) {
     Json j(cJSON_CreateObject(), cJSON_Delete);
     esp_chip_info_t chip;
     esp_chip_info(&chip);
@@ -126,11 +141,12 @@ static std::string telemetry() {
     snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip.ip));
     cJSON_AddStringToObject(j.get(), "device", "Heltec WiFi LoRa 32 V3");
     cJSON_AddStringToObject(j.get(), "chip", "ESP32-S3");
-    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.1.0");
+    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.2.0");
     cJSON_AddNumberToObject(j.get(), "chip_revision", chip.revision);
     cJSON_AddNumberToObject(j.get(), "cpu_cores", chip.cores);
     cJSON_AddNumberToObject(j.get(), "cpu_frequency_mhz", CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ);
     cJSON_AddNumberToObject(j.get(), "uptime_seconds", esp_timer_get_time() / 1000000.0);
+    std::lock_guard<std::mutex> temperatureLock(temperatureMutex);
     float temp = 0;
     if (temperatureReady && temp_sensor_read_celsius(&temp) == ESP_OK && std::isfinite(temp))
         cJSON_AddNumberToObject(j.get(), "chip_temperature_c", temp);
@@ -145,7 +161,21 @@ static std::string telemetry() {
     cJSON_AddNumberToObject(j.get(), "flash_bytes", spi_flash_get_chip_size());
     cJSON_AddNumberToObject(j.get(), "wifi_rssi_dbm", ap.rssi);
     cJSON_AddStringToObject(j.get(), "local_ip", ipstr);
-    cJSON_AddBoolToObject(j.get(), "tunnel_connected", connected);
+    const unsigned count = ConnectionState::count(connections.snapshot());
+    cJSON_AddBoolToObject(j.get(), "tunnel_connected", count > 0);
+    cJSON_AddBoolToObject(j.get(), "tunnel_healthy", count == ConnectionState::desired);
+    cJSON_AddNumberToObject(j.get(), "tunnel_connections", count);
+    cJSON_AddNumberToObject(j.get(), "tunnel_connections_desired", ConnectionState::desired);
+    cJSON_AddNumberToObject(j.get(), "served_by_connection", connectionIndex);
+    auto details = cJSON_AddArrayToObject(j.get(), "connections");
+    for (unsigned i = 0; i < ConnectionState::desired; ++i) {
+        auto item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "index", i);
+        cJSON_AddNumberToObject(item, "requests", connectionRequests[i]);
+        cJSON_AddNumberToObject(item, "reconnections", connectionRetries[i]);
+        cJSON_AddNumberToObject(item, "stack_free_bytes", stackFree[i]);
+        cJSON_AddItemToArray(details, item);
+    }
     cJSON_AddStringToObject(j.get(), "tunnel_transport", "native TLS/HTTP2");
     cJSON_AddNumberToObject(j.get(), "requests_served", requests);
     cJSON_AddNumberToObject(j.get(), "reconnections", reconnects);
@@ -191,6 +221,44 @@ struct Stream {
     size_t offset = 0, headerBytes = 0;
     bool control = false, responded = false;
 };
+static std::string chooseEdge(const char *region, unsigned index, unsigned attempt) {
+    esp_netif_dns_info_t dns{};
+    if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) != ESP_OK ||
+        dns.ip.type != ESP_IPADDR_TYPE_V4)
+        throw std::runtime_error("IPv4 DNS unavailable");
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0)
+        throw std::runtime_error("DNS socket unavailable");
+    struct SocketCloser {
+        int fd;
+        ~SocketCloser() { close(fd); }
+    } closer{fd};
+    sockaddr_in resolver{};
+    resolver.sin_family = AF_INET;
+    resolver.sin_port = htons(53);
+    resolver.sin_addr.s_addr = dns.ip.u_addr.ip4.addr;
+    timeval timeout{3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (connect(fd, reinterpret_cast<sockaddr *>(&resolver), sizeof(resolver)) != 0)
+        throw std::runtime_error("DNS connect failed");
+    auto query = edge_dns::query(region, uint16_t(esp_random()));
+    if (send(fd, query.data(), query.size(), 0) != int(query.size()))
+        throw std::runtime_error("DNS send failed");
+    std::vector<uint8_t> response(2048);
+    int received = recv(fd, response.data(), response.size(), 0);
+    if (received <= 0)
+        throw std::runtime_error("DNS timeout");
+    response.resize(received);
+    auto addresses = edge_dns::parse(response, query);
+    for (unsigned n = 0; n < addresses.size(); ++n) {
+        const auto &address = addresses[(index / 2 + attempt + n) % addresses.size()];
+        char text[16];
+        inet_ntop(AF_INET, address.data(), text, sizeof(text));
+        if (std::find(edgeAddresses.begin(), edgeAddresses.end(), text) == edgeAddresses.end())
+            return text;
+    }
+    throw std::runtime_error("No unused edge address available");
+}
 class Tunnel {
     esp_tls_t *tls = nullptr;
     nghttp2_session *h2 = nullptr;
@@ -198,11 +266,12 @@ class Tunnel {
     rpc::Bytes rpcInput;
     int32_t controlId = 0;
     bool failed = false;
-    struct Route {
-        std::string host, service;
-    };
-    std::vector<Route> routes;
-    int appliedVersion = -1;
+    const unsigned index;
+    bool registered = false;
+    static ssize_t frameLength(nghttp2_session *, uint8_t, int32_t, int32_t connectionWindow,
+                               int32_t streamWindow, uint32_t maxFrame, void *) {
+        return std::min({uint32_t(connectionWindow), uint32_t(streamWindow), maxFrame, 2048u});
+    }
     int64_t began = 0, lastRx = 0, lastPing = 0;
     static Tunnel &self(void *p) { return *static_cast<Tunnel *>(p); }
     static nghttp2_nv nv(const char *name, const char *value) {
@@ -262,7 +331,7 @@ class Tunnel {
     static int beginHeaders(nghttp2_session *, const nghttp2_frame *f, void *p) {
         auto &t = self(p);
         if (f->hd.type == NGHTTP2_HEADERS && f->headers.cat == NGHTTP2_HCAT_REQUEST) {
-            if (t.streams.size() >= 12)
+            if (t.streams.size() >= 20)
                 return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             t.streams.emplace(f->hd.stream_id, Stream{});
         }
@@ -315,6 +384,7 @@ class Tunnel {
                 valid = false;
             next.push_back({field(rule, "hostname"), service});
         }
+        std::lock_guard<std::mutex> lock(routesMutex);
         if (valid && v->valueint > appliedVersion) {
             routes = std::move(next);
             appliedVersion = v->valueint;
@@ -338,6 +408,9 @@ class Tunnel {
         host = host.substr(0, host.find(':'));
         std::transform(host.begin(), host.end(), host.begin(),
                        [](unsigned char c) { return std::tolower(c); });
+        std::lock_guard<std::mutex> lock(routesMutex);
+        if (appliedVersion < 0)
+            return "pending";
         for (const auto &r : routes) {
             if (r.host.empty() || host == r.host)
                 return r.service;
@@ -354,6 +427,8 @@ class Tunnel {
         auto &t = self(p);
         t.lastRx = esp_timer_get_time();
         if (f->hd.type == NGHTTP2_GOAWAY) {
+            ESP_LOGW(TAG, "Connection %u received GOAWAY code=%lu", t.index,
+                     static_cast<unsigned long>(f->goaway.error_code));
             t.failed = true;
             return 0;
         }
@@ -372,7 +447,12 @@ class Tunnel {
                     s.control = true;
                     t.respond(t.controlId, "");
                     t.queue(rpc::bootstrap());
-                    t.queue(rpc::registration(credentials));
+                    auto registrationCredentials = credentials;
+                    esp_netif_ip_info_t ip{};
+                    esp_netif_get_ip_info(netif, &ip);
+                    auto bytes = reinterpret_cast<uint8_t *>(&ip.ip.addr);
+                    registrationCredentials.ip.assign(bytes, bytes + 4);
+                    t.queue(rpc::registration(registrationCredentials, t.index));
                     ESP_LOGI(TAG, "Control stream opened; registering connector");
                 } else if (s.upgrade == "update-configuration") {
                     // Configuration JSON arrives as DATA and is acknowledged at END_STREAM.
@@ -382,16 +462,18 @@ class Tunnel {
                     t.respond(f->hd.stream_id, "{\"error\":\"use GET or HEAD\"}", "405");
                 else {
                     auto path = s.path.substr(0, s.path.find('?'));
-                    if (t.appliedVersion < 0)
+                    const auto service = t.serviceFor(s.host);
+                    if (service == "pending")
                         t.respond(f->hd.stream_id, "{\"error\":\"configuration pending\"}", "503",
                                   s.method == "HEAD");
-                    else if (t.serviceFor(s.host) == "http_status:404" ||
+                    else if (service == "http_status:404" ||
                              (path != "/" && path != "/api/telemetry" && path != "/healthz"))
                         t.respond(f->hd.stream_id, "{\"error\":\"not found\"}", "404",
                                   s.method == "HEAD");
                     else {
                         ++requests;
-                        t.respond(f->hd.stream_id, path == "/" ? "" : telemetry(), "200",
+                        ++connectionRequests[t.index];
+                        t.respond(f->hd.stream_id, path == "/" ? "" : telemetry(t.index), "200",
                                   s.method == "HEAD", path == "/");
                     }
                 }
@@ -425,8 +507,11 @@ class Tunnel {
                     t.rpcInput.erase(t.rpcInput.begin(), t.rpcInput.begin() + size);
                     auto reply = rpc::parse(frame);
                     if (reply.kind == rpc::Reply::Registered) {
-                        connected = true;
-                        ESP_LOGI(TAG, "TUNNEL REGISTERED at %s", reply.detail.c_str());
+                        t.registered = true;
+                        connections.set(t.index, true);
+                        ESP_LOGI(TAG, "TUNNEL REGISTERED index=%u at %s (%u/4)", t.index,
+                                 reply.detail.c_str(),
+                                 ConnectionState::count(connections.snapshot()));
                         t.queue(rpc::finish(1));
                     } else if (reply.kind == rpc::Reply::Rejected) {
                         // Do not log server-provided credential-related error text.
@@ -445,6 +530,11 @@ class Tunnel {
         }
         return 0;
     }
+    static int invalidFrame(nghttp2_session *, const nghttp2_frame *, int error, void *p) {
+        ESP_LOGW(TAG, "Connection %u invalid HTTP/2 frame: %s", self(p).index,
+                 nghttp2_strerror(error));
+        return 0;
+    }
     static int closeStream(nghttp2_session *, int32_t id, uint32_t, void *p) {
         auto &t = self(p);
         if (id == t.controlId)
@@ -454,15 +544,21 @@ class Tunnel {
     }
 
   public:
+    explicit Tunnel(unsigned connectionIndex) : index(connectionIndex) {}
     ~Tunnel() {
-        connected = false;
+        connections.set(index, false);
         if (h2)
             nghttp2_session_del(h2);
         if (tls)
             esp_tls_conn_destroy(tls);
+        std::lock_guard<std::mutex> lock(handshakeMutex);
+        edgeAddresses[index].clear();
     }
     void run(unsigned attempt) {
-        const char *host = attempt % 2 ? "region2.v2.argotunnel.com" : "region1.v2.argotunnel.com";
+        std::unique_lock<std::mutex> handshake(handshakeMutex);
+        const char *region = index % 2 ? "region2.v2.argotunnel.com" : "region1.v2.argotunnel.com";
+        const std::string host = chooseEdge(region, index, attempt);
+        edgeAddresses[index] = host;
         esp_tls_cfg_t cfg{};
         cfg.common_name = "h2.cftunnel.com";
         cfg.cacert_buf = reinterpret_cast<const uint8_t *>(CLOUDFLARE_CA);
@@ -471,30 +567,35 @@ class Tunnel {
         tls = esp_tls_init();
         if (!tls)
             throw std::bad_alloc();
-        ESP_LOGI(TAG, "Connecting to %s:7844 with verified TLS", host);
-        if (esp_tls_conn_new_sync(host, strlen(host), 7844, &cfg, tls) != 1)
+        ESP_LOGI(TAG, "Connecting index=%u to %s:7844 with verified TLS", index, host.c_str());
+        if (esp_tls_conn_new_sync(host.c_str(), host.size(), 7844, &cfg, tls) != 1)
             throw std::runtime_error("TLS connect failed");
+        const unsigned generation = wifiGeneration.load();
+        handshake.unlock();
         int fd = -1;
         ESP_ERROR_CHECK(esp_tls_get_conn_sockfd(tls, &fd));
         timeval tv{1, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         nghttp2_session_callbacks *cb = nullptr;
-        nghttp2_session_callbacks_new(&cb);
+        if (nghttp2_session_callbacks_new(&cb))
+            throw std::bad_alloc();
+        nghttp2_session_callbacks_set_data_source_read_length_callback(cb, frameLength);
         nghttp2_session_callbacks_set_on_begin_headers_callback(cb, beginHeaders);
         nghttp2_session_callbacks_set_on_header_callback(cb, header);
         nghttp2_session_callbacks_set_on_frame_recv_callback(cb, frame);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, data);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, closeStream);
+        nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(cb, invalidFrame);
         int ret = nghttp2_session_server_new(&h2, cb, this);
         nghttp2_session_callbacks_del(cb);
         if (ret)
             throw std::runtime_error("HTTP/2 initialization failed");
-        nghttp2_settings_entry settings[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 8},
+        nghttp2_settings_entry settings[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 16},
                                              {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 4096},
                                              {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, 8192}};
         nghttp2_submit_settings(h2, NGHTTP2_FLAG_NONE, settings, 3);
         began = lastRx = lastPing = esp_timer_get_time();
-        while (!failed && (xEventGroupGetBits(events) & 1)) {
+        while (!failed && (xEventGroupGetBits(events) & 1) && wifiGeneration == generation) {
             const uint8_t *out = nullptr;
             ssize_t size;
             while ((size = nghttp2_session_mem_send(h2, &out)) > 0) {
@@ -520,7 +621,7 @@ class Tunnel {
                      n != MBEDTLS_ERR_SSL_TIMEOUT)
                 throw std::runtime_error("TLS read failed");
             int64_t now = esp_timer_get_time();
-            if (!connected && now - began > 45000000)
+            if (!registered && now - began > 45000000)
                 throw std::runtime_error("registration timeout");
             if (now - lastRx > 90000000)
                 throw std::runtime_error("edge heartbeat timeout");
@@ -530,6 +631,7 @@ class Tunnel {
                 nghttp2_submit_ping(h2, 0, ping);
                 lastPing = now;
             }
+            stackFree[index] = uxTaskGetStackHighWaterMark(nullptr);
             vTaskDelay(1);
         }
     }
@@ -538,14 +640,41 @@ static void wifiEvent(void *, esp_event_base_t base, int32_t id, void *arg) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
         esp_wifi_connect();
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ++wifiGeneration;
         xEventGroupClearBits(events, 1);
-        connected = false;
+        connections.clear();
         esp_wifi_connect();
     }
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         auto e = static_cast<ip_event_got_ip_t *>(arg);
         ESP_LOGI(TAG, "Wi-Fi connected: " IPSTR, IP2STR(&e->ip_info.ip));
         xEventGroupSetBits(events, 1);
+    }
+}
+static void tunnelWorker(void *arg) {
+    const unsigned index = reinterpret_cast<uintptr_t>(arg);
+    vTaskDelay(pdMS_TO_TICKS(index * 1500));
+    unsigned failures = 0;
+    for (unsigned attempt = 0;; ++attempt) {
+        xEventGroupWaitBits(events, 1, pdFALSE, pdTRUE, portMAX_DELAY);
+        while (time(nullptr) < 1700000000) {
+            ESP_LOGI(TAG, "Waiting for time sync for certificate verification");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        int64_t started = esp_timer_get_time();
+        try {
+            Tunnel t(index);
+            t.run(attempt);
+        } catch (const std::exception &e) {
+            ESP_LOGW(TAG, "Connection %u ended: %s", index, e.what());
+        }
+        connections.set(index, false);
+        ++connectionRetries[index];
+        ++reconnects;
+        if (esp_timer_get_time() - started > 120000000)
+            failures = 0;
+        unsigned delay = std::min(60u, 2u << std::min(failures++, 5u));
+        vTaskDelay(pdMS_TO_TICKS(delay * 1000 + esp_random() % 1000));
     }
 }
 extern "C" void app_main() {
@@ -622,29 +751,10 @@ extern "C" void app_main() {
     sntp_setservername(0, const_cast<char *>("pool.ntp.org"));
     sntp_setservername(1, const_cast<char *>("time.nist.gov"));
     sntp_init();
-    unsigned failures = 0;
-    for (unsigned attempt = 0;; ++attempt) {
-        xEventGroupWaitBits(events, 1, pdFALSE, pdTRUE, portMAX_DELAY);
-        while (time(nullptr) < 1700000000) {
-            ESP_LOGI(TAG, "Waiting for time sync for certificate verification");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-        esp_netif_ip_info_t ip{};
-        esp_netif_get_ip_info(netif, &ip);
-        auto ipbytes = reinterpret_cast<uint8_t *>(&ip.ip.addr);
-        credentials.ip.assign(ipbytes, ipbytes + 4);
-        int64_t started = esp_timer_get_time();
-        try {
-            Tunnel t;
-            t.run(attempt);
-        } catch (const std::exception &e) {
-            ESP_LOGW(TAG, "Connection ended: %s", e.what());
-        }
-        connected = false;
-        ++reconnects;
-        if (esp_timer_get_time() - started > 120000000)
-            failures = 0;
-        unsigned delay = std::min(60u, 2u << std::min(failures++, 5u));
-        vTaskDelay(pdMS_TO_TICKS(delay * 1000 + esp_random() % 1000));
+    for (unsigned i = 1; i < ConnectionState::desired; ++i) {
+        if (xTaskCreate(tunnelWorker, "tunnel", 12288, reinterpret_cast<void *>(i), 5, nullptr) !=
+            pdPASS)
+            ESP_LOGE(TAG, "Unable to allocate worker %u", i);
     }
+    tunnelWorker(nullptr);
 }

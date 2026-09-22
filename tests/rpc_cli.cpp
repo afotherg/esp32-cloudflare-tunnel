@@ -12,7 +12,7 @@ int main(int argc, char **argv) {
             c.tunnel = rpc::Bytes(16, 0x54);
             c.client = rpc::Bytes(16, 0x43);
             c.ip = {192, 168, 1, 2};
-            auto b = rpc::registration(c);
+            auto b = rpc::registration(c, argc > 2 ? std::stoi(argv[2]) : 0);
             std::cout.write(reinterpret_cast<char *>(b.data()), b.size());
         } else if (mode == "bootstrap") {
             auto b = rpc::bootstrap();

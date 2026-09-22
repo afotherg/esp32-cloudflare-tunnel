@@ -50,6 +50,16 @@ class CodecTests(unittest.TestCase):
             self.assertEqual(list(params.options.client.features), ['allow_remote_config', 'serialized_headers'])
             self.assertEqual(params.options.originLocalIp, bytes([192,168,1,2]))
 
+    def test_four_connection_indices(self):
+        for index in range(4):
+            p = subprocess.run([str(CLI), 'registration', str(index)], capture_output=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with RPC.Message.from_bytes(p.stdout) as m:
+                params = m.call.params.content.as_struct(TUNNEL.RegistrationServer.schema.methods['registerConnection'].param_type)
+                self.assertEqual(params.connIndex, index)
+                self.assertEqual(params.options.client.clientId, b'C'*16)
+        self.assertEqual(subprocess.run([str(CLI), 'registration', '4'], capture_output=True).returncode, 1)
+
     def test_bootstrap(self):
         with RPC.Message.from_bytes(invoke('bootstrap').stdout) as m:
             self.assertEqual(m.which(), 'bootstrap')
