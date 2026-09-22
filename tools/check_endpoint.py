@@ -3,6 +3,7 @@
 import argparse
 import concurrent.futures
 import json
+import gzip
 import urllib.error
 import urllib.request
 
@@ -28,6 +29,16 @@ def fetch(path='/api/telemetry', method='GET'):
 page = fetch('/')
 assert b'Inside the chip.' in page and b"fetch('/api/telemetry'" in page
 assert fetch('/', method='HEAD') == b''
+for encoding, compressed in [('gzip', True), ('identity', False)]:
+    req = urllib.request.Request(base+'/', headers={'Accept-Encoding': encoding,
+                                                   'User-Agent': 'ESP32-Telemetry-Check/1.0'})
+    with urllib.request.urlopen(req, timeout=20) as res:
+        data = res.read()
+        assert (res.headers.get('Content-Encoding') == 'gzip') == compressed
+        html = gzip.decompress(data) if compressed else data
+        # Cloudflare may inject per-request scripts into HTML responses.
+        assert b'Inside the chip.' in html and b"fetch('/api/telemetry'" in html
+        assert 'accept-encoding' in res.headers.get('Vary', '').lower()
 assert fetch('/healthz')['chip'] == 'ESP32-S3'
 first = fetch()
 assert first['chip'] == 'ESP32-S3'

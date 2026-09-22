@@ -167,7 +167,7 @@ Bytes registration(const Credentials &c, uint8_t connectionIndex) {
     size_t client = w.structure(opts + 1, 0, 4);
     w.bytes(client, c.client);
     w.texts(client + 1, {"allow_remote_config", "serialized_headers"});
-    w.text(client + 2, "esp32-native-0.2.0");
+    w.text(client + 2, "esp32-native-0.3.0");
     w.text(client + 3, "espidf_esp32s3");
     w.bytes(opts + 2, c.ip);
     return w.frame();

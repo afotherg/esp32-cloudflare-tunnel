@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "http_policy.hpp"
 #include "lwip/apps/sntp.h"
 #include "lwip/sockets.h"
 #include "mbedtls/base64.h"
@@ -33,15 +34,20 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <netinet/tcp.h>
 #include <stdexcept>
 
 static constexpr char TAG[] = "tunnel";
 static EventGroupHandle_t events;
 static esp_netif_t *netif;
 static ConnectionState connections;
+static HttpAdmission admission;
+static std::atomic<unsigned> overloads{0}, refusedStreams{0};
+static std::atomic<unsigned> openStreams[ConnectionState::desired]{};
 static std::atomic<unsigned> wifiGeneration{0};
 static std::mutex handshakeMutex, routesMutex, temperatureMutex;
 struct Route {
@@ -94,7 +100,7 @@ static bool validIp(const std::string &ip) {
     return inet_pton(AF_INET, ip.c_str(), address) == 1 ||
            inet_pton(AF_INET6, ip.c_str(), address) == 1;
 }
-static std::string requestIp(const std::string &serialized) {
+static std::string requestHeader(const std::string &serialized, const char *wanted) {
     // Cloudflare's negotiated serialized_headers feature encodes each name/value
     // using unpadded base64. CF-Connecting-IP is set by the trusted edge.
     size_t start = 0;
@@ -114,11 +120,8 @@ static std::string requestIp(const std::string &serialized) {
                 std::string name = decode(serialized.substr(start, colon - start));
                 std::transform(name.begin(), name.end(), name.begin(),
                                [](unsigned char c) { return std::tolower(c); });
-                if (name == "cf-connecting-ip") {
-                    auto ip = decode(serialized.substr(colon + 1, end - colon - 1));
-                    if (validIp(ip))
-                        return ip;
-                }
+                if (name == wanted)
+                    return decode(serialized.substr(colon + 1, end - colon - 1));
             } catch (...) {
                 return {};
             }
@@ -141,7 +144,7 @@ static std::string telemetry(int connectionIndex = -1) {
     snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip.ip));
     cJSON_AddStringToObject(j.get(), "device", "Heltec WiFi LoRa 32 V3");
     cJSON_AddStringToObject(j.get(), "chip", "ESP32-S3");
-    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.2.0");
+    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.3.0");
     cJSON_AddNumberToObject(j.get(), "chip_revision", chip.revision);
     cJSON_AddNumberToObject(j.get(), "cpu_cores", chip.cores);
     cJSON_AddNumberToObject(j.get(), "cpu_frequency_mhz", CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ);
@@ -171,6 +174,7 @@ static std::string telemetry(int connectionIndex = -1) {
     for (unsigned i = 0; i < ConnectionState::desired; ++i) {
         auto item = cJSON_CreateObject();
         cJSON_AddNumberToObject(item, "index", i);
+        cJSON_AddNumberToObject(item, "open_streams", openStreams[i]);
         cJSON_AddNumberToObject(item, "requests", connectionRequests[i]);
         cJSON_AddNumberToObject(item, "reconnections", connectionRetries[i]);
         cJSON_AddNumberToObject(item, "stack_free_bytes", stackFree[i]);
@@ -178,6 +182,9 @@ static std::string telemetry(int connectionIndex = -1) {
     }
     cJSON_AddStringToObject(j.get(), "tunnel_transport", "native TLS/HTTP2");
     cJSON_AddNumberToObject(j.get(), "requests_served", requests);
+    cJSON_AddNumberToObject(j.get(), "active_requests", admission.count());
+    cJSON_AddNumberToObject(j.get(), "overload_responses", overloads);
+    cJSON_AddNumberToObject(j.get(), "refused_streams", refusedStreams);
     cJSON_AddNumberToObject(j.get(), "reconnections", reconnects);
     cJSON_AddNumberToObject(j.get(), "reset_reason", esp_reset_reason());
     cJSON_AddBoolToObject(j.get(), "oled_ready", requestDisplayHealthy());
@@ -204,6 +211,15 @@ static esp_err_t localHandler(httpd_req_t *r) {
         if (std::string(r->uri).substr(0, std::string(r->uri).find('?')) == "/") {
             httpd_resp_set_type(r, "text/html; charset=utf-8");
             httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+            httpd_resp_set_hdr(r, "Vary", "Accept-Encoding");
+            char encoding[256]{};
+            if (httpd_req_get_hdr_value_str(r, "Accept-Encoding", encoding, sizeof(encoding)) ==
+                    ESP_OK &&
+                acceptsGzip(encoding)) {
+                httpd_resp_set_hdr(r, "Content-Encoding", "gzip");
+                return httpd_resp_send(r, reinterpret_cast<const char *>(DASHBOARD_GZIP),
+                                       sizeof(DASHBOARD_GZIP));
+            }
             return httpd_resp_send(r, DASHBOARD_HTML, sizeof(DASHBOARD_HTML) - 1);
         }
         auto body = telemetry();
@@ -219,7 +235,7 @@ struct Stream {
     const char *staticBody = nullptr;
     size_t staticLength = 0;
     size_t offset = 0, headerBytes = 0;
-    bool control = false, responded = false;
+    bool control = false, responded = false, gzip = false, admitted = false;
 };
 static std::string chooseEdge(const char *region, unsigned index, unsigned attempt) {
     esp_netif_dns_info_t dns{};
@@ -305,15 +321,23 @@ class Tunnel {
         auto &s = streams.at(id);
         s.responded = true;
         s.output = head ? "" : body;
-        s.staticBody = html && !head ? DASHBOARD_HTML : nullptr;
-        s.staticLength = html && !head ? sizeof(DASHBOARD_HTML) - 1 : 0;
+        s.staticBody = html && !head ? (s.gzip ? reinterpret_cast<const char *>(DASHBOARD_GZIP)
+                                               : DASHBOARD_HTML)
+                                     : nullptr;
+        s.staticLength =
+            html && !head ? (s.gzip ? sizeof(DASHBOARD_GZIP) : sizeof(DASHBOARD_HTML) - 1) : 0;
         s.offset = 0;
+        std::string serialized =
+            html ? "Q29udGVudC1UeXBl:dGV4dC9odG1sOyBjaGFyc2V0PXV0Zi04;Q2FjaGUtQ29udHJvbA:"
+                   "bm8tc3RvcmU;VmFyeQ:QWNjZXB0LUVuY29kaW5n"
+                 : "Q29udGVudC1UeXBl:YXBwbGljYXRpb24vanNvbg;Q2FjaGUtQ29udHJvbA:bm8tc3RvcmU";
+        if (html && s.gzip)
+            serialized += ";Q29udGVudC1FbmNvZGluZw:Z3ppcA";
+        if (strcmp(status, "503") == 0)
+            serialized += ";UmV0cnktQWZ0ZXI:MQ";
         auto headers = std::vector<nghttp2_nv>{
             nv(":status", status), nv("cf-cloudflared-response-meta", "{\"src\":\"origin\"}"),
-            nv("cf-cloudflared-response-headers",
-               html ? "Q29udGVudC1UeXBl:dGV4dC9odG1sOyBjaGFyc2V0PXV0Zi04;Q2FjaGUtQ29udHJvbA:"
-                      "bm8tc3RvcmU"
-                    : "Q29udGVudC1UeXBl:YXBwbGljYXRpb24vanNvbg;Q2FjaGUtQ29udHJvbA:bm8tc3RvcmU")};
+            nv("cf-cloudflared-response-headers", serialized.c_str())};
         nghttp2_data_provider provider{};
         provider.read_callback = readData;
         if (nghttp2_submit_response(h2, id, headers.data(), headers.size(), &provider) != 0)
@@ -331,9 +355,16 @@ class Tunnel {
     static int beginHeaders(nghttp2_session *, const nghttp2_frame *f, void *p) {
         auto &t = self(p);
         if (f->hd.type == NGHTTP2_HEADERS && f->headers.cat == NGHTTP2_HCAT_REQUEST) {
-            if (t.streams.size() >= 20)
-                return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+            // Metadata has a separate ceiling from admitted application work.
+            // Refuse only this stream if the peer exceeds that safety bound.
+            if (t.streams.size() >= 64) {
+                ++refusedStreams;
+                nghttp2_submit_rst_stream(t.h2, NGHTTP2_FLAG_NONE, f->hd.stream_id,
+                                          NGHTTP2_REFUSED_STREAM);
+                return 0;
+            }
             t.streams.emplace(f->hd.stream_id, Stream{});
+            openStreams[t.index] = t.streams.size();
         }
         return 0;
     }
@@ -359,10 +390,13 @@ class Tunnel {
             s.upgrade = v;
         else if (key == "cf-connecting-ip" && validIp(v))
             s.clientIp = v;
+        else if (key == "accept-encoding")
+            s.gzip = acceptsGzip(v);
         else if (key == "cf-cloudflared-request-headers") {
-            auto ip = requestIp(v);
-            if (!ip.empty())
+            auto ip = requestHeader(v, "cf-connecting-ip");
+            if (validIp(ip))
                 s.clientIp = ip;
+            s.gzip = acceptsGzip(requestHeader(v, "accept-encoding"));
         }
         return 0;
     }
@@ -470,7 +504,14 @@ class Tunnel {
                              (path != "/" && path != "/api/telemetry" && path != "/healthz"))
                         t.respond(f->hd.stream_id, "{\"error\":\"not found\"}", "404",
                                   s.method == "HEAD");
-                    else {
+                    else if (!admission.acquire(esp_get_free_heap_size(),
+                                                heap_caps_get_largest_free_block(
+                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) {
+                        ++overloads;
+                        t.respond(f->hd.stream_id, "{\"error\":\"busy; retry shortly\"}", "503",
+                                  s.method == "HEAD");
+                    } else {
+                        s.admitted = true;
                         ++requests;
                         ++connectionRequests[t.index];
                         t.respond(f->hd.stream_id, path == "/" ? "" : telemetry(t.index), "200",
@@ -539,7 +580,11 @@ class Tunnel {
         auto &t = self(p);
         if (id == t.controlId)
             t.failed = true;
+        auto it = t.streams.find(id);
+        if (it != t.streams.end() && it->second.admitted)
+            admission.release();
         t.streams.erase(id);
+        openStreams[t.index] = t.streams.size();
         return 0;
     }
 
@@ -547,6 +592,10 @@ class Tunnel {
     explicit Tunnel(unsigned connectionIndex) : index(connectionIndex) {}
     ~Tunnel() {
         connections.set(index, false);
+        for (const auto &stream : streams)
+            if (stream.second.admitted)
+                admission.release();
+        openStreams[index] = 0;
         if (h2)
             nghttp2_session_del(h2);
         if (tls)
@@ -574,8 +623,10 @@ class Tunnel {
         handshake.unlock();
         int fd = -1;
         ESP_ERROR_CHECK(esp_tls_get_conn_sockfd(tls, &fd));
-        timeval tv{1, 0};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0)
+            throw std::runtime_error("nonblocking socket setup failed");
+        int noDelay = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
         nghttp2_session_callbacks *cb = nullptr;
         if (nghttp2_session_callbacks_new(&cb))
             throw std::bad_alloc();
@@ -586,40 +637,76 @@ class Tunnel {
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, data);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, closeStream);
         nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(cb, invalidFrame);
-        int ret = nghttp2_session_server_new(&h2, cb, this);
+        nghttp2_option *options = nullptr;
+        if (nghttp2_option_new(&options)) {
+            nghttp2_session_callbacks_del(cb);
+            throw std::bad_alloc();
+        }
+        // Retaining closed streams for the legacy priority tree fragments the
+        // ESP32 heap during sustained traffic. Only active streams need state.
+        nghttp2_option_set_no_closed_streams(options, 1);
+        nghttp2_option_set_max_deflate_dynamic_table_size(options, 1024);
+        int ret = nghttp2_session_server_new2(&h2, cb, this, options);
+        nghttp2_option_del(options);
         nghttp2_session_callbacks_del(cb);
         if (ret)
             throw std::runtime_error("HTTP/2 initialization failed");
-        nghttp2_settings_entry settings[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 16},
-                                             {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 4096},
+        nghttp2_settings_entry settings[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 64},
+                                             {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 1024},
                                              {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, 8192}};
         nghttp2_submit_settings(h2, NGHTTP2_FLAG_NONE, settings, 3);
         began = lastRx = lastPing = esp_timer_get_time();
+        // Own pending bytes: receiving can mutate nghttp2 state. On TLS WANT_WRITE
+        // retry exactly the same pointer and length before advancing the buffer.
+        rpc::Bytes pending;
+        size_t written = 0;
+        int64_t writeStarted = 0;
         while (!failed && (xEventGroupGetBits(events) & 1) && wifiGeneration == generation) {
-            const uint8_t *out = nullptr;
-            ssize_t size;
-            while ((size = nghttp2_session_mem_send(h2, &out)) > 0) {
-                size_t pos = 0;
-                while (pos < size_t(size)) {
-                    ssize_t n = esp_tls_conn_write(tls, out + pos, size - pos);
-                    if (n <= 0)
-                        throw std::runtime_error("TLS write failed");
-                    pos += n;
+            bool progress = false;
+            size_t budget = 8192;
+            while (budget) {
+                if (written == pending.size()) {
+                    const uint8_t *out = nullptr;
+                    ssize_t size = nghttp2_session_mem_send(h2, &out);
+                    if (size < 0)
+                        throw std::runtime_error("HTTP/2 write failed");
+                    pending.clear();
+                    written = 0;
+                    if (!size)
+                        break;
+                    pending.assign(out, out + size);
+                    writeStarted = esp_timer_get_time();
                 }
+                ssize_t n =
+                    esp_tls_conn_write(tls, pending.data() + written, pending.size() - written);
+                if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE)
+                    break;
+                if (n <= 0)
+                    throw std::runtime_error("TLS write failed");
+                written += n;
+                budget -= std::min(budget, size_t(n));
+                progress = true;
             }
-            if (size < 0)
-                throw std::runtime_error("HTTP/2 write failed");
-            uint8_t in[2048];
-            ssize_t n = esp_tls_conn_read(tls, in, sizeof(in));
-            if (n > 0) {
-                ssize_t used = nghttp2_session_mem_recv(h2, in, n);
-                if (used < 0 || used != n)
-                    throw std::runtime_error("HTTP/2 receive failed");
-            } else if (n == 0)
-                throw std::runtime_error("edge closed TLS");
-            else if (n != MBEDTLS_ERR_SSL_WANT_READ && n != MBEDTLS_ERR_SSL_WANT_WRITE &&
-                     n != MBEDTLS_ERR_SSL_TIMEOUT)
-                throw std::runtime_error("TLS read failed");
+            // Bound work in both directions so DATA cannot starve requests,
+            // WINDOW_UPDATE, control messages, or the other connector tasks.
+            for (unsigned reads = 0; reads < 4; ++reads) {
+                uint8_t in[2048];
+                ssize_t n = esp_tls_conn_read(tls, in, sizeof(in));
+                if (n > 0) {
+                    progress = true;
+                    ssize_t used = nghttp2_session_mem_recv(h2, in, n);
+                    if (used < 0 || used != n)
+                        throw std::runtime_error("HTTP/2 receive failed");
+                } else if (n == 0)
+                    throw std::runtime_error("edge closed TLS");
+                else if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
+                         n == MBEDTLS_ERR_SSL_TIMEOUT)
+                    break;
+                else
+                    throw std::runtime_error("TLS read failed");
+            }
+            if (written < pending.size() && esp_timer_get_time() - writeStarted > 15000000)
+                throw std::runtime_error("TLS write stalled");
             int64_t now = esp_timer_get_time();
             if (!registered && now - began > 45000000)
                 throw std::runtime_error("registration timeout");
@@ -632,7 +719,18 @@ class Tunnel {
                 lastPing = now;
             }
             stackFree[index] = uxTaskGetStackHighWaterMark(nullptr);
-            vTaskDelay(1);
+            if (progress)
+                vTaskDelay(1);
+            else {
+                fd_set readable, writable;
+                FD_ZERO(&readable);
+                FD_ZERO(&writable);
+                FD_SET(fd, &readable);
+                if (written < pending.size())
+                    FD_SET(fd, &writable);
+                timeval idle{0, 50000};
+                select(fd + 1, &readable, &writable, nullptr, &idle);
+            }
         }
     }
 };

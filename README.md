@@ -27,6 +27,8 @@ The page uses no external fonts, scripts, or images.
 - Allocated, free, minimum free, and largest contiguous internal heap sizes.
 - Uptime, CPU frequency and cores, chip revision, flash size, and SDK version.
 - Wi-Fi RSSI, local IP, tunnel connection status, request count, and reconnects.
+- Active application requests, open streams per connection, overload responses,
+  and refused-stream counters.
 
 Tunnel endpoints also support HEAD. Unknown paths return 404 and other methods
 return 405. Responses use `Cache-Control: no-store`. `/healthz` returns the same
@@ -35,8 +37,11 @@ Heap metrics refer to allocatable internal 8-bit heap, not all physical RAM.
 
 Edit `web/dashboard.html` to change the dashboard. The PlatformIO pre-build step
 embeds it into a generated `src/dashboard_asset.hpp`; this generated file is
-ignored. The tunnel streams the page directly from flash rather than allocating
-a full HTML copy per request. Credentials remain entirely separate from the page.
+ignored. The build embeds both the original HTML and a deterministic gzip copy in flash.
+Clients accepting gzip receive the compressed page (about 7.9 KB rather than
+23.1 KB); other clients receive the original. Both are streamed from flash
+without allocating a full HTML copy per request. Responses include
+`Vary: Accept-Encoding`. Credentials remain entirely separate from the page.
 
 ## OLED request display
 
@@ -198,14 +203,74 @@ python -m unittest discover -s tests -v
 c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -pthread -I src \
     src/edge_dns.cpp tests/connection_cli.cpp -o tests/build/connection_cli
 tests/build/connection_cli
+c++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -pthread -I src \
+    tests/http_policy_cli.cpp -o tests/build/http_policy_cli
+tests/build/http_policy_cli
 python tools/check_endpoint.py https://esp32.example.com
 ```
 
-The four-connection build has been tested on a Heltec V3 without PSRAM with
-120 public requests using 12 concurrent clients, keeping all four connections
-registered throughout the run. The lowest free internal heap recorded since
-boot was approximately 69,000 bytes. This is a short hardware
-validation, not a long-term availability guarantee.
+To compare HTML and telemetry separately at increasing concurrency:
+
+```sh
+python tools/benchmark.py https://esp32.example.com --requests 1000 \
+    --concurrency 1 5 10 20 --timeout 10 --output /tmp/esp32-benchmark.json
+```
+
+The report includes successful requests per second, HTTP status counts, transport
+errors, latency percentiles, and telemetry snapshots before and after each case.
+The client verifies HTTPS certificates and decodes compressed responses. Byte
+counts refer to decoded bodies, not bytes on the wire. Cloudflare may modify or
+recompress HTML; the local endpoint is useful for checking the firmware's exact
+representation. `loadtest.py` can also run a single case.
+
+### Handling load
+
+Version 0.3.0 uses nonblocking TLS sockets and alternates bounded reads and writes,
+so page transfers do not prevent processing HTTP/2 flow-control updates. Pending
+TLS writes retain their bytes across retries. TCP_NODELAY avoids delaying small
+responses. Closed HTTP/2 streams are discarded instead of being retained for
+legacy priority bookkeeping, and header compression tables are limited to 1 KiB.
+
+The firmware admits at most 24 application requests across the four connections.
+It also reserves free heap for TLS and networking. If either limit is reached,
+new application requests receive a small `503` JSON response with `Retry-After: 1`;
+already admitted requests continue. A separate 64-stream limit per connection
+bounds protocol metadata. Exceeding that bound refuses the stream. The limits
+are safeguards, not a promise of throughput at every concurrency level.
+
+`overload_responses` counts those application rejections, `refused_streams` counts
+metadata-limit refusals, and `connections[].open_streams` includes control streams.
+The OLED continues to coalesce requests, with per-update logs at debug level to
+avoid serial logging overhead during load.
+
+### Measured results
+
+On a Heltec V3 without PSRAM, a public HTTPS dashboard test with 1,000 requests,
+20 concurrent clients, and a 10-second timeout completed in 55.45 seconds:
+999 HTTP 200 responses, one controlled HTTP 503, and no 502s, transport errors,
+or tunnel reconnects. Successful throughput was 18.02 requests/second; mean
+successful latency was 1.10 seconds and p95 was 3.56 seconds.
+
+A matching 1,000-request telemetry test at concurrency 20 completed in 24.09
+seconds with 1,000 HTTP 200 responses, no errors or reconnects, and 41.52 successful
+requests/second. Mean successful latency was 477 ms.
+
+A separate 200-request sweep per case produced:
+
+| Endpoint | Concurrency | HTTP 200 | HTTP 503 | Successful requests/sec | Mean successful latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `/` | 1 | 200 | 0 | 11.34 | 88 ms |
+| `/` | 5 | 200 | 0 | 17.33 | 287 ms |
+| `/` | 10 | 200 | 0 | 17.54 | 558 ms |
+| `/` | 20 | 199 | 1 | 17.62 | 1083 ms |
+| `/api/telemetry` | 1 | 200 | 0 | 15.39 | 65 ms |
+| `/api/telemetry` | 5 | 200 | 0 | 39.55 | 126 ms |
+| `/api/telemetry` | 10 | 200 | 0 | 40.21 | 243 ms |
+| `/api/telemetry` | 20 | 200 | 0 | 36.16 | 480 ms |
+
+All four tunnel connections remained registered throughout the sweep. Free heap
+returned to approximately 108 KB after each case. These results were measured
+through Cloudflare on 2026-09-22; network conditions and request mix affect results.
 
 ## Protocol and scope
 
@@ -230,7 +295,7 @@ tunnel; it does not add application authentication.
 
 ### Cloudflare dashboard status
 
-Version 0.2.0 targets **Healthy** by registering four concurrent connections with
+The client targets **Healthy** by registering four concurrent connections with
 indexes 0–3 under the same connector ID. It selects distinct edge addresses, with
 two connections to each Cloudflare region. Each connection reconnects independently;
 routing configuration is shared so requests can arrive over any connection.

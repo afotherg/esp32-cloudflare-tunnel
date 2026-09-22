@@ -111,7 +111,7 @@ void worker(void *) {
             text(55, latest.ip + 21);
         if (flush()) {
             ++updates;
-            ESP_LOGI(
+            ESP_LOGD(
                 "oled", "Request displayed; I2C acknowledged; time %s; client IP %s (update %u)",
                 latest.time >= 1700000000 ? "synced" : "pending",
                 strcmp(latest.ip, "UNAVAILABLE") ? "present" : "missing", unsigned(updates.load()));
