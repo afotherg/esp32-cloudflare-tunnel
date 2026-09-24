@@ -2,15 +2,17 @@
 #include "cJSON.h"
 #include "connection_state.hpp"
 #include "dashboard_asset.hpp"
-#include "driver/temp_sensor.h"
+#include "driver/temperature_sensor.h"
 #include "edge_dns.hpp"
+#include "esp_chip_info.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
+#include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_spi_flash.h"
+#include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
@@ -19,7 +21,6 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "http_policy.hpp"
-#include "lwip/apps/sntp.h"
 #include "lwip/sockets.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/ssl.h"
@@ -61,6 +62,7 @@ static std::atomic<unsigned> connectionRetries[ConnectionState::desired]{};
 static std::atomic<unsigned> stackFree[ConnectionState::desired]{};
 static std::atomic<unsigned> requests{0}, reconnects{0};
 static bool temperatureReady = false;
+static temperature_sensor_handle_t temperatureSensor = nullptr;
 using Json = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
 static Json json(const char *s) { return Json(cJSON_Parse(s), cJSON_Delete); }
 static std::string stringify(cJSON *j) {
@@ -144,14 +146,15 @@ static std::string telemetry(int connectionIndex = -1) {
     snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip.ip));
     cJSON_AddStringToObject(j.get(), "device", "Heltec WiFi LoRa 32 V3");
     cJSON_AddStringToObject(j.get(), "chip", "ESP32-S3");
-    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.3.0");
+    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.4.0");
     cJSON_AddNumberToObject(j.get(), "chip_revision", chip.revision);
     cJSON_AddNumberToObject(j.get(), "cpu_cores", chip.cores);
     cJSON_AddNumberToObject(j.get(), "cpu_frequency_mhz", CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ);
     cJSON_AddNumberToObject(j.get(), "uptime_seconds", esp_timer_get_time() / 1000000.0);
     std::lock_guard<std::mutex> temperatureLock(temperatureMutex);
     float temp = 0;
-    if (temperatureReady && temp_sensor_read_celsius(&temp) == ESP_OK && std::isfinite(temp))
+    if (temperatureReady && temperature_sensor_get_celsius(temperatureSensor, &temp) == ESP_OK &&
+        std::isfinite(temp))
         cJSON_AddNumberToObject(j.get(), "chip_temperature_c", temp);
     else
         cJSON_AddNullToObject(j.get(), "chip_temperature_c");
@@ -161,7 +164,9 @@ static std::string telemetry(int connectionIndex = -1) {
     cJSON_AddNumberToObject(j.get(), "heap_free_bytes", heap.total_free_bytes);
     cJSON_AddNumberToObject(j.get(), "heap_minimum_free_bytes", heap.minimum_free_bytes);
     cJSON_AddNumberToObject(j.get(), "heap_largest_free_block_bytes", heap.largest_free_block);
-    cJSON_AddNumberToObject(j.get(), "flash_bytes", spi_flash_get_chip_size());
+    uint32_t flashBytes = 0;
+    esp_flash_get_size(nullptr, &flashBytes);
+    cJSON_AddNumberToObject(j.get(), "flash_bytes", flashBytes);
     cJSON_AddNumberToObject(j.get(), "wifi_rssi_dbm", ap.rssi);
     cJSON_AddStringToObject(j.get(), "local_ip", ipstr);
     const unsigned count = ConnectionState::count(connections.snapshot());
@@ -180,7 +185,7 @@ static std::string telemetry(int connectionIndex = -1) {
         cJSON_AddNumberToObject(item, "stack_free_bytes", stackFree[i]);
         cJSON_AddItemToArray(details, item);
     }
-    cJSON_AddStringToObject(j.get(), "tunnel_transport", "native TLS/HTTP2");
+    cJSON_AddStringToObject(j.get(), "tunnel_transport", "native TLS1.3/HTTP2");
     cJSON_AddNumberToObject(j.get(), "requests_served", requests);
     cJSON_AddNumberToObject(j.get(), "active_requests", admission.count());
     cJSON_AddNumberToObject(j.get(), "overload_responses", overloads);
@@ -286,7 +291,8 @@ class Tunnel {
     bool registered = false;
     static ssize_t frameLength(nghttp2_session *, uint8_t, int32_t, int32_t connectionWindow,
                                int32_t streamWindow, uint32_t maxFrame, void *) {
-        return std::min({uint32_t(connectionWindow), uint32_t(streamWindow), maxFrame, 2048u});
+        return std::min<uint32_t>(
+            {uint32_t(connectionWindow), uint32_t(streamWindow), maxFrame, 2048});
     }
     int64_t began = 0, lastRx = 0, lastPing = 0;
     static Tunnel &self(void *p) { return *static_cast<Tunnel *>(p); }
@@ -610,6 +616,7 @@ class Tunnel {
         edgeAddresses[index] = host;
         esp_tls_cfg_t cfg{};
         cfg.common_name = "h2.cftunnel.com";
+        cfg.tls_version = ESP_TLS_VER_TLS_1_3;
         cfg.cacert_buf = reinterpret_cast<const uint8_t *>(CLOUDFLARE_CA);
         cfg.cacert_bytes = sizeof(CLOUDFLARE_CA);
         cfg.timeout_ms = 15000;
@@ -619,6 +626,11 @@ class Tunnel {
         ESP_LOGI(TAG, "Connecting index=%u to %s:7844 with verified TLS", index, host.c_str());
         if (esp_tls_conn_new_sync(host.c_str(), host.size(), 7844, &cfg, tls) != 1)
             throw std::runtime_error("TLS connect failed");
+        auto ssl = static_cast<mbedtls_ssl_context *>(esp_tls_get_ssl_context(tls));
+        if (mbedtls_ssl_get_version_number(ssl) != MBEDTLS_SSL_VERSION_TLS1_3)
+            throw std::runtime_error("TLS 1.3 required");
+        ESP_LOGI(TAG, "Connection %u negotiated %s (%s)", index, mbedtls_ssl_get_version(ssl),
+                 mbedtls_ssl_get_ciphersuite(ssl));
         const unsigned generation = wifiGeneration.load();
         handshake.unlock();
         int fd = -1;
@@ -687,9 +699,11 @@ class Tunnel {
                 budget -= std::min(budget, size_t(n));
                 progress = true;
             }
-            // Bound work in both directions so DATA cannot starve requests,
-            // WINDOW_UPDATE, control messages, or the other connector tasks.
-            for (unsigned reads = 0; reads < 4; ++reads) {
+            // Read one chunk before returning to writes. Prefetching multiple
+            // chunks queues response bodies while TLS 1.3 still owns its input
+            // record, needlessly consuming the heap reserved for networking.
+            // Always read even when writes block, to receive WINDOW_UPDATE.
+            {
                 uint8_t in[2048];
                 ssize_t n = esp_tls_conn_read(tls, in, sizeof(in));
                 if (n > 0) {
@@ -699,10 +713,8 @@ class Tunnel {
                         throw std::runtime_error("HTTP/2 receive failed");
                 } else if (n == 0)
                     throw std::runtime_error("edge closed TLS");
-                else if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
-                         n == MBEDTLS_ERR_SSL_TIMEOUT)
-                    break;
-                else
+                else if (n != MBEDTLS_ERR_SSL_WANT_READ && n != MBEDTLS_ERR_SSL_WANT_WRITE &&
+                         n != MBEDTLS_ERR_SSL_TIMEOUT)
                     throw std::runtime_error("TLS read failed");
             }
             if (written < pending.size() && esp_timer_get_time() - writeStarted > 15000000)
@@ -832,8 +844,9 @@ extern "C" void app_main() {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);
-    temp_sensor_config_t ts = TSENS_CONFIG_DEFAULT();
-    temperatureReady = temp_sensor_set_config(ts) == ESP_OK && temp_sensor_start() == ESP_OK;
+    temperature_sensor_config_t ts = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    temperatureReady = temperature_sensor_install(&ts, &temperatureSensor) == ESP_OK &&
+                       temperature_sensor_enable(temperatureSensor) == ESP_OK;
     httpd_config_t http = HTTPD_DEFAULT_CONFIG();
     http.stack_size = 6144;
     httpd_handle_t server = nullptr;
@@ -845,12 +858,12 @@ extern "C" void app_main() {
             route.handler = localHandler;
             httpd_register_uri_handler(server, &route);
         }
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, const_cast<char *>("pool.ntp.org"));
-    sntp_setservername(1, const_cast<char *>("time.nist.gov"));
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, const_cast<char *>("pool.ntp.org"));
+    esp_sntp_setservername(1, const_cast<char *>("time.nist.gov"));
+    esp_sntp_init();
     for (unsigned i = 1; i < ConnectionState::desired; ++i) {
-        if (xTaskCreate(tunnelWorker, "tunnel", 12288, reinterpret_cast<void *>(i), 5, nullptr) !=
+        if (xTaskCreate(tunnelWorker, "tunnel", 8192, reinterpret_cast<void *>(i), 5, nullptr) !=
             pdPASS)
             ESP_LOGE(TAG, "Unable to allocate worker %u", i);
     }

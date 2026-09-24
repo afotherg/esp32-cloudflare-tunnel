@@ -63,7 +63,7 @@ so network handling does not wait for OLED transfers.
 
 ## Build
 
-The tested toolchain is PlatformIO Espressif32 5.4.0 with ESP-IDF 4.4.5. It is
+The tested toolchain is PlatformIO Espressif32 6.13.0 with ESP-IDF 5.5.3. It is
 pinned in `platformio.ini`; PlatformIO installs the required ESP32-S3 toolchain.
 Install PlatformIO Core, clone this repository, and run the commands below from
 the repository directory on the computer connected to the board.
@@ -74,10 +74,16 @@ cd esp32-cloudflare-tunnel
 pio run
 ```
 
-When upgrading an existing checkout from 0.1.0, remove the generated
+When upgrading an existing checkout from a version before 0.4.0, remove the generated
 `sdkconfig.heltec_wifi_lora_32_v3` file and run `pio run -t clean` before
-`pio run`. This applies the new socket and TLS memory settings from
+`pio run`. This applies the TLS 1.3, socket, and memory settings from
 `sdkconfig.defaults`. It does not change the credentials stored on the board.
+
+The HTTP/2 library is pinned through `src/idf_component.yml` and
+`dependencies.lock`; ESP-IDF downloads it into the ignored `managed_components/`
+directory. TLS 1.3 is required and verified after each handshake. Cloudflare's
+tunnel edges can reject TLS 1.2, so older ESP-IDF 4.4 builds cannot reliably
+reconnect. Certificate-chain and hostname verification remain enabled.
 
 ## Provision credentials
 
@@ -158,6 +164,18 @@ python -m esptool --chip esp32s3 --port "$ESP32_PORT" --baud 115200 \
     0x10000 .pio/build/heltec_wifi_lora_32_v3/firmware.bin
 ```
 
+When upgrading an already provisioned board from ESP-IDF 4.4 to this ESP-IDF 5.5
+build, update the bootloader, partition table, and application together, preserving
+NVS by omitting the `0x9000` write:
+
+```sh
+python -m esptool --chip esp32s3 --port "$ESP32_PORT" --baud 115200 \
+    write_flash --flash_mode dio --flash_freq 80m --flash_size 8MB \
+    0x0 .pio/build/heltec_wifi_lora_32_v3/bootloader.bin \
+    0x8000 .pio/build/heltec_wifi_lora_32_v3/partitions.bin \
+    0x10000 .pio/build/heltec_wifi_lora_32_v3/firmware.bin
+```
+
 For subsequent firmware-only updates, rebuild and write only the application
 partition, preserving the stored Wi-Fi and tunnel credentials:
 
@@ -173,7 +191,7 @@ Read startup logs from the same local serial port:
 python tools/monitor.py --port "$ESP32_PORT" --seconds 60
 ```
 
-Successful startup logs show Wi-Fi connection, verified TLS, `TUNNEL REGISTERED`,
+Successful startup logs show Wi-Fi connection, `negotiated TLSv1.3`, `TUNNEL REGISTERED`,
 and the hostname received through remote configuration. An NTP time sync is
 required before TLS certificate verification. Outbound TCP 7844 must be allowed.
 Once provisioned, the board needs power and Wi-Fi; the computer is not needed
@@ -225,10 +243,11 @@ representation. `loadtest.py` can also run a single case.
 
 ### Handling load
 
-Version 0.3.0 uses nonblocking TLS sockets and alternates bounded reads and writes,
+The firmware uses nonblocking TLS sockets and alternates bounded reads and writes,
 so page transfers do not prevent processing HTTP/2 flow-control updates. Pending
-TLS writes retain their bytes across retries. TCP_NODELAY avoids delaying small
-responses. Closed HTTP/2 streams are discarded instead of being retained for
+TLS writes retain their bytes across retries. Each loop reads at most 2 KiB
+before returning to response writes, limiting queued work while TLS owns its
+receive buffer. TCP_NODELAY avoids delaying small responses. Closed HTTP/2 streams are discarded instead of being retained for
 legacy priority bookkeeping, and header compression tables are limited to 1 KiB.
 
 The firmware admits at most 24 application requests across the four connections.
@@ -245,36 +264,32 @@ avoid serial logging overhead during load.
 
 ### Measured results
 
-On a Heltec V3 without PSRAM, a public HTTPS dashboard test with 1,000 requests,
-20 concurrent clients, and a 10-second timeout completed in 55.45 seconds:
-999 HTTP 200 responses, one controlled HTTP 503, and no 502s, transport errors,
-or tunnel reconnects. Successful throughput was 18.02 requests/second; mean
-successful latency was 1.10 seconds and p95 was 3.56 seconds.
+ESP32-native 0.4.0 (TLS 1.3, ESP-IDF 5.5.3) was tested through Cloudflare on a
+Heltec V3 without PSRAM on 2026-09-24. Each case below used 1,000 requests,
+20 concurrent clients, and a 10-second timeout:
 
-A matching 1,000-request telemetry test at concurrency 20 completed in 24.09
-seconds with 1,000 HTTP 200 responses, no errors or reconnects, and 41.52 successful
-requests/second. Mean successful latency was 477 ms.
-
-A separate 200-request sweep per case produced:
-
-| Endpoint | Concurrency | HTTP 200 | HTTP 503 | Successful requests/sec | Mean successful latency |
+| Endpoint | HTTP 200 | HTTP 503 | Successful requests/sec | Mean successful latency | p95 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `/` | 1 | 200 | 0 | 11.34 | 88 ms |
-| `/` | 5 | 200 | 0 | 17.33 | 287 ms |
-| `/` | 10 | 200 | 0 | 17.54 | 558 ms |
-| `/` | 20 | 199 | 1 | 17.62 | 1083 ms |
-| `/api/telemetry` | 1 | 200 | 0 | 15.39 | 65 ms |
-| `/api/telemetry` | 5 | 200 | 0 | 39.55 | 126 ms |
-| `/api/telemetry` | 10 | 200 | 0 | 40.21 | 243 ms |
-| `/api/telemetry` | 20 | 200 | 0 | 36.16 | 480 ms |
+| `/` | 958 | 42 | 21.54 | 877 ms | 1474 ms |
+| `/api/telemetry` | 1000 | 0 | 43.96 | 450 ms | 865 ms |
 
-All four tunnel connections remained registered throughout the sweep. Free heap
-returned to approximately 108 KB after each case. These results were measured
-through Cloudflare on 2026-09-22; network conditions and request mix affect results.
+Both cases had **zero 502s, transport errors, or tunnel reconnects**. All four
+connections remained registered. The dashboard's 503s were controlled overload
+responses; concurrency 20 can still exceed its memory budget with TLS 1.3.
+A separate 200-request check at concurrency 10 returned 195 HTTP 200s and five
+503s for `/`, and 200 HTTP 200s for `/api/telemetry`, again without transport
+errors or reconnects. Clients should honor `Retry-After`; even concurrency 10
+can occasionally trigger the guard for HTML. These tests request each URL
+directly; they do not execute the page's
+JavaScript or its subsequent telemetry polls.
+
+Free heap returned to approximately 100 KB after load, and tunnel task stack
+headroom stayed above 1.8 KiB. Network conditions and request mix affect results;
+these measurements are not a sustained-capacity guarantee.
 
 ## Protocol and scope
 
-The ESP32 opens TLS to `region1.v2.argotunnel.com:7844` or region 2, verifying the
+The ESP32 opens TLS 1.3 to `region1.v2.argotunnel.com:7844` or region 2, verifying the
 Cloudflare Origin CA chain and the `h2.cftunnel.com` certificate identity. Cloudflare
 then acts as the HTTP/2 client on that connection. ESP-IDF's nghttp2 server handles
 framing, HPACK, flow control, and multiplexing. A small bounded Cap'n Proto codec
@@ -307,8 +322,12 @@ remains true while at least one connection is registered. These are the device's
 observations; Cloudflare's dashboard may take time to reflect a change.
 
 To fit four connections on the ESP32-S3 without PSRAM, TLS handshakes run one at a
-time, mbedTLS releases temporary handshake data and idle record buffers, and
-HTTP/2 response data frames are limited to 2 KiB. Certificate validation remains
+time, mbedTLS releases CA certificates and idle record buffers, and HTTP/2
+response data frames are limited to 2 KiB. The size-optimized build omits TLS 1.2
+and places optional Wi-Fi fast-path and non-ISR FreeRTOS code in flash to make
+room for TLS 1.3. Six static Wi-Fi receive buffers match the block-ack window;
+all four tunnel tasks use 8 KiB stacks. Stack headroom is exposed in telemetry.
+Certificate validation remains
 enabled for every connection. Four connections on one board do not protect
 against loss of power or Wi-Fi to that board.
 

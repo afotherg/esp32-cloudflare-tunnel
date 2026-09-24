@@ -1,0 +1,2 @@
+dependencies:
+  espressif/nghttp: "1.68.1"

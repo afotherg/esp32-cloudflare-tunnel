@@ -65,7 +65,7 @@ void text(int y, const char *value) {
         x += 6;
     }
 }
-bool write(uint8_t control, const uint8_t *data, size_t size) {
+bool displayWrite(uint8_t control, const uint8_t *data, size_t size) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     if (!cmd)
         return false;
@@ -80,7 +80,7 @@ bool write(uint8_t control, const uint8_t *data, size_t size) {
 }
 bool flush() {
     const uint8_t range[] = {0x21, 0, 127, 0x22, 0, 7};
-    bool ok = write(0, range, sizeof(range)) && write(0x40, pixels, sizeof(pixels));
+    bool ok = displayWrite(0, range, sizeof(range)) && displayWrite(0x40, pixels, sizeof(pixels));
     healthy = ok;
     return ok;
 }
@@ -142,7 +142,7 @@ void requestDisplayInit() {
     const uint8_t init[] = {0xae, 0xd5, 0x80, 0xa8, 0x3f, 0xd3, 0,    0x40, 0x8d,
                             0x14, 0x20, 0,    0xa1, 0xc8, 0xda, 0x12, 0x81, 0x7f,
                             0xd9, 0xf1, 0xdb, 0x40, 0xa4, 0xa6, 0xaf};
-    if (!write(0, init, sizeof(init))) {
+    if (!displayWrite(0, init, sizeof(init))) {
         ESP_LOGW("oled", "Display not detected");
         return;
     }
