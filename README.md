@@ -245,7 +245,20 @@ errors, latency percentiles, and telemetry snapshots before and after each case.
 The client verifies HTTPS certificates and decodes compressed responses. Byte
 counts refer to decoded bodies, not bytes on the wire. Cloudflare may modify or
 recompress HTML; the local endpoint is useful for checking the firmware's exact
-representation. `loadtest.py` can also run a single case.
+representation. `loadtest.py` can also run a single case. It adds a uniformly
+random delay of 0–250 ms before every request, including the initial requests:
+
+```sh
+python loadtest.py https://esp32.example.com/api/telemetry -n 1000 -c 20
+python loadtest.py https://esp32.example.com/api/telemetry --jitter 0.5
+python loadtest.py https://esp32.example.com/api/telemetry --jitter 0
+```
+
+`--jitter` is the maximum delay in seconds; `0` restores the original unpaced
+behavior. Waiting holds a concurrency slot, so concurrency is an upper bound on
+in-flight requests. The delay is excluded from request latency and timeout, but
+included in total duration and throughput. `tools/benchmark.py` remains unpaced,
+matching the measured results below.
 
 ### Handling load
 

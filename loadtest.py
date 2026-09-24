@@ -3,13 +3,20 @@
 import asyncio
 import aiohttp
 import argparse
+import math
+import random
 import time
 import statistics
 from collections import Counter
 
 
-async def fetch(session, url, semaphore, results):
+async def fetch(session, url, semaphore, results, jitter):
     async with semaphore:
+        # Hold the slot while waiting so queued tasks cannot accumulate and
+        # bypass the pacing. Include initial requests, but exclude this delay
+        # from request latency and the HTTP timeout.
+        if jitter > 0:
+            await asyncio.sleep(random.uniform(0, jitter))
         start = time.perf_counter()
 
         try:
@@ -47,7 +54,7 @@ async def fetch(session, url, semaphore, results):
             })
 
 
-async def run_test(url, requests, concurrency, timeout):
+async def run_test(url, requests, concurrency, timeout, jitter=0.25):
     semaphore = asyncio.Semaphore(concurrency)
     results = []
 
@@ -68,13 +75,14 @@ async def run_test(url, requests, concurrency, timeout):
         print(f"Requests:    {requests}")
         print(f"Concurrency: {concurrency}")
         print(f"Timeout:     {timeout} seconds")
+        print(f"Jitter:      0–{jitter:g} seconds before each request")
         print()
 
         start = time.perf_counter()
 
         tasks = [
             asyncio.create_task(
-                fetch(session, url, semaphore, results)
+                fetch(session, url, semaphore, results, jitter)
             )
             for _ in range(requests)
         ]
@@ -256,7 +264,7 @@ def main():
         "--concurrency",
         type=int,
         default=20,
-        help="Number of simultaneous requests",
+        help="Maximum concurrent request slots (including jitter waits)",
     )
 
     parser.add_argument(
@@ -264,6 +272,14 @@ def main():
         type=float,
         default=10,
         help="Request timeout in seconds",
+    )
+
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=0.25,
+        metavar="SECONDS",
+        help="Random delay from 0 to SECONDS before each request (default: 0.25; 0 disables)",
     )
 
     args = parser.parse_args()
@@ -277,12 +293,16 @@ def main():
     if args.timeout <= 0:
         parser.error("timeout must be greater than 0")
 
+    if not math.isfinite(args.jitter) or args.jitter < 0:
+        parser.error("jitter must be a finite, nonnegative number")
+
     results, total_time = asyncio.run(
         run_test(
             args.url,
             args.requests,
             args.concurrency,
             args.timeout,
+            args.jitter,
         )
     )
 
