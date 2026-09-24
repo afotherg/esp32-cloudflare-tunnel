@@ -57,6 +57,12 @@ struct Route {
 static std::vector<Route> routes;
 static int appliedVersion = -1;
 static std::array<std::string, ConnectionState::desired> edgeAddresses;
+// A short-lived lock for published connection details, independent of TLS handshakes.
+static std::mutex edgeInfoMutex;
+struct EdgeInfo {
+    std::string ip, location;
+};
+static std::array<EdgeInfo, ConnectionState::desired> edgeInfo;
 static std::atomic<unsigned> connectionRequests[ConnectionState::desired]{};
 static std::atomic<unsigned> connectionRetries[ConnectionState::desired]{};
 static std::atomic<unsigned> stackFree[ConnectionState::desired]{};
@@ -169,7 +175,9 @@ static std::string telemetry(int connectionIndex = -1) {
     cJSON_AddNumberToObject(j.get(), "flash_bytes", flashBytes);
     cJSON_AddNumberToObject(j.get(), "wifi_rssi_dbm", ap.rssi);
     cJSON_AddStringToObject(j.get(), "local_ip", ipstr);
-    const unsigned count = ConnectionState::count(connections.snapshot());
+    std::lock_guard<std::mutex> edgeLock(edgeInfoMutex);
+    const auto connectedMask = connections.snapshot();
+    const unsigned count = ConnectionState::count(connectedMask);
     cJSON_AddBoolToObject(j.get(), "tunnel_connected", count > 0);
     cJSON_AddBoolToObject(j.get(), "tunnel_healthy", count == ConnectionState::desired);
     cJSON_AddNumberToObject(j.get(), "tunnel_connections", count);
@@ -179,6 +187,17 @@ static std::string telemetry(int connectionIndex = -1) {
     for (unsigned i = 0; i < ConnectionState::desired; ++i) {
         auto item = cJSON_CreateObject();
         cJSON_AddNumberToObject(item, "index", i);
+        const bool connected = connectedMask & (1u << i);
+        cJSON_AddBoolToObject(item, "connected", connected);
+        cJSON_AddStringToObject(item, "edge_hostname",
+                                i % 2 ? "region2.v2.argotunnel.com" : "region1.v2.argotunnel.com");
+        if (connected) {
+            cJSON_AddStringToObject(item, "edge_ip", edgeInfo[i].ip.c_str());
+            cJSON_AddStringToObject(item, "edge_location", edgeInfo[i].location.c_str());
+        } else {
+            cJSON_AddNullToObject(item, "edge_ip");
+            cJSON_AddNullToObject(item, "edge_location");
+        }
         cJSON_AddNumberToObject(item, "open_streams", openStreams[i]);
         cJSON_AddNumberToObject(item, "requests", connectionRequests[i]);
         cJSON_AddNumberToObject(item, "reconnections", connectionRetries[i]);
@@ -555,7 +574,11 @@ class Tunnel {
                     auto reply = rpc::parse(frame);
                     if (reply.kind == rpc::Reply::Registered) {
                         t.registered = true;
-                        connections.set(t.index, true);
+                        {
+                            std::lock_guard<std::mutex> lock(edgeInfoMutex);
+                            edgeInfo[t.index] = {edgeAddresses[t.index], reply.detail};
+                            connections.set(t.index, true);
+                        }
                         ESP_LOGI(TAG, "TUNNEL REGISTERED index=%u at %s (%u/4)", t.index,
                                  reply.detail.c_str(),
                                  ConnectionState::count(connections.snapshot()));
@@ -597,7 +620,11 @@ class Tunnel {
   public:
     explicit Tunnel(unsigned connectionIndex) : index(connectionIndex) {}
     ~Tunnel() {
-        connections.set(index, false);
+        {
+            std::lock_guard<std::mutex> lock(edgeInfoMutex);
+            connections.set(index, false);
+            edgeInfo[index] = {};
+        }
         for (const auto &stream : streams)
             if (stream.second.admitted)
                 admission.release();

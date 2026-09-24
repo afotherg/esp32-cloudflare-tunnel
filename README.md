@@ -61,6 +61,12 @@ The SSD1306 uses SDA 17, SCL 18, reset 21, and active-low Vext 36 on the Heltec 
 A separate task coalesces bursts to the latest request and bounds display I/O,
 so network handling does not wait for OLED transfers.
 
+The dashboard also lists all four Cloudflare connections, including their reported
+edge location (such as `sjc06`), connected IP address, regional hostname, and
+connection status. These details refresh with telemetry; disconnected connections
+show no current IP or location. The API exposes them as `connected`, `edge_ip`,
+`edge_location`, and `edge_hostname` in each `connections` entry.
+
 ## Build
 
 The tested toolchain is PlatformIO Espressif32 6.13.0 with ESP-IDF 5.5.3. It is

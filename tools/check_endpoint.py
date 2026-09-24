@@ -3,6 +3,7 @@
 import argparse
 import concurrent.futures
 import json
+import ipaddress
 import gzip
 import urllib.error
 import urllib.request
@@ -45,6 +46,15 @@ assert first['chip'] == 'ESP32-S3'
 assert first['tunnel_connected'] is True
 assert first['tunnel_connections'] == args.connections
 assert first['tunnel_healthy'] == (args.connections == first['tunnel_connections_desired'])
+assert len(first['connections']) == first['tunnel_connections_desired']
+assert sum(c['connected'] for c in first['connections']) == first['tunnel_connections']
+for connection in first['connections']:
+    assert connection['edge_hostname'] in ('region1.v2.argotunnel.com', 'region2.v2.argotunnel.com')
+    if connection['connected']:
+        ipaddress.ip_address(connection['edge_ip'])
+        assert connection['edge_location']
+    else:
+        assert connection['edge_ip'] is None and connection['edge_location'] is None
 assert first['heap_free_bytes'] > 0
 assert first['heap_used_bytes'] > 0
 assert first['chip_temperature_c'] is None or -10 <= first['chip_temperature_c'] <= 80
