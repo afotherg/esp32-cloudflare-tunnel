@@ -40,16 +40,17 @@ int main() {
     }
     auto addresses = edge_dns::parse(response, query);
     assert(addresses.size() == 2 && addresses[0][3] == 1 && addresses[1][3] == 2);
-    auto rejected = [&](std::vector<uint8_t> data) {
-        try {
-            edge_dns::parse(data, query);
-        } catch (const std::runtime_error &) {
-            return;
-        }
-        assert(false);
+    auto rejected = [&](const std::vector<uint8_t> &data) {
+        assert(edge_dns::parse(data, query).empty());
     };
     for (size_t size = 0; size < response.size(); ++size)
         rejected(std::vector<uint8_t>(response.begin(), response.begin() + size));
+    assert(edge_dns::query("", 1).empty());
+    assert(edge_dns::query(std::string(64, 'a') + ".com", 1).empty());
+    auto noAnswers = query;
+    noAnswers[2] = 0x81;
+    noAnswers[3] = 0x80;
+    rejected(noAnswers);
     auto invalid = response;
     invalid[0] ^= 1;
     rejected(invalid);

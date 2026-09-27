@@ -8,3 +8,4 @@ tests/build/
 credentials.json
 src/dashboard_asset.hpp
 managed_components/
+sdkconfig.dns_timeout_test

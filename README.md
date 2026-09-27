@@ -306,6 +306,31 @@ Free heap returned to approximately 100 KB after load, and tunnel task stack
 headroom stayed above 1.8 KiB. Network conditions and request mix affect results;
 these measurements are not a sustained-capacity guarantee.
 
+### DNS and connection recovery
+
+DNS is used when establishing each Cloudflare edge connection, including a
+reconnection after Wi-Fi loss or an edge disconnect. Existing connections carry
+web requests without further DNS lookups. This client currently makes a fresh
+lookup on each connection attempt rather than caching DNS answers, allowing it
+to discover updated edge addresses.
+
+Starting with 0.4.1, DNS timeouts, DNS error/malformed replies, and ordinary
+TLS/HTTP2 connection failures return explicit errors to the worker. The worker
+releases its resources and retries with the existing 2–60 second backoff plus
+jitter. These expected network failures do not use C++ exception unwinding.
+Other registered connections remain available while one worker recovers.
+
+For hardware regression testing, `pio run -e dns_timeout_test` builds a special
+image that suppresses worker 0's first two DNS queries, exercising real
+three-second socket receive timeouts. Its logs should show two `DNS timeout`
+retries followed by all four registrations in the same boot. Deploy the normal
+`heltec_wifi_lora_32_v3` environment afterward; the test hook is compiled out of
+that build. This test image is not intended for normal operation.
+
+The hardware test recovered from both injected timeouts in one boot, kept the
+other three connections registered, and returned to four connections with only
+worker 0's retry counter incremented twice.
+
 ## Protocol and scope
 
 The ESP32 opens TLS 1.3 to `region1.v2.argotunnel.com:7844` or region 2, verifying the

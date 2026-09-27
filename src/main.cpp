@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -152,7 +153,7 @@ static std::string telemetry(int connectionIndex = -1) {
     snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip.ip));
     cJSON_AddStringToObject(j.get(), "device", "Heltec WiFi LoRa 32 V3");
     cJSON_AddStringToObject(j.get(), "chip", "ESP32-S3");
-    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.4.0");
+    cJSON_AddStringToObject(j.get(), "firmware", "esp32-native-0.4.1");
     cJSON_AddNumberToObject(j.get(), "chip_revision", chip.revision);
     cJSON_AddNumberToObject(j.get(), "cpu_cores", chip.cores);
     cJSON_AddNumberToObject(j.get(), "cpu_frequency_mhz", CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ);
@@ -261,14 +262,15 @@ struct Stream {
     size_t offset = 0, headerBytes = 0;
     bool control = false, responded = false, gzip = false, admitted = false;
 };
-static std::string chooseEdge(const char *region, unsigned index, unsigned attempt) {
+static const char *chooseEdge(const char *region, unsigned index, unsigned attempt,
+                              std::string &host) {
     esp_netif_dns_info_t dns{};
     if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) != ESP_OK ||
         dns.ip.type != ESP_IPADDR_TYPE_V4)
-        throw std::runtime_error("IPv4 DNS unavailable");
+        return "IPv4 DNS unavailable";
     int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0)
-        throw std::runtime_error("DNS socket unavailable");
+        return "DNS socket unavailable";
     struct SocketCloser {
         int fd;
         ~SocketCloser() { close(fd); }
@@ -278,26 +280,42 @@ static std::string chooseEdge(const char *region, unsigned index, unsigned attem
     resolver.sin_port = htons(53);
     resolver.sin_addr.s_addr = dns.ip.u_addr.ip4.addr;
     timeval timeout{3, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+        return "DNS receive timeout setup failed";
     if (connect(fd, reinterpret_cast<sockaddr *>(&resolver), sizeof(resolver)) != 0)
-        throw std::runtime_error("DNS connect failed");
+        return "DNS connect failed";
     auto query = edge_dns::query(region, uint16_t(esp_random()));
-    if (send(fd, query.data(), query.size(), 0) != int(query.size()))
-        throw std::runtime_error("DNS send failed");
+    if (query.empty())
+        return "Invalid DNS hostname";
+    bool dropRequest = false;
+#ifdef ESP32_TEST_DNS_TIMEOUTS
+    // Test build only: exercise real receive timeouts twice on worker 0.
+    dropRequest = index == 0 && attempt < 2;
+    if (dropRequest)
+        ESP_LOGW(TAG, "TEST: suppressing DNS query for index=%u attempt=%u", index, attempt);
+#endif
+    if (!dropRequest && send(fd, query.data(), query.size(), 0) != int(query.size()))
+        return "DNS send failed";
     std::vector<uint8_t> response(2048);
     int received = recv(fd, response.data(), response.size(), 0);
-    if (received <= 0)
-        throw std::runtime_error("DNS timeout");
+    if (received < 0)
+        return errno == EAGAIN || errno == EWOULDBLOCK ? "DNS timeout" : "DNS receive failed";
+    if (received == 0)
+        return "Empty DNS response";
     response.resize(received);
     auto addresses = edge_dns::parse(response, query);
+    if (addresses.empty())
+        return "Invalid DNS response or no IPv4 edge addresses";
     for (unsigned n = 0; n < addresses.size(); ++n) {
         const auto &address = addresses[(index / 2 + attempt + n) % addresses.size()];
         char text[16];
         inet_ntop(AF_INET, address.data(), text, sizeof(text));
-        if (std::find(edgeAddresses.begin(), edgeAddresses.end(), text) == edgeAddresses.end())
-            return text;
+        if (std::find(edgeAddresses.begin(), edgeAddresses.end(), text) == edgeAddresses.end()) {
+            host = text;
+            return nullptr;
+        }
     }
-    throw std::runtime_error("No unused edge address available");
+    return "No unused edge address available";
 }
 class Tunnel {
     esp_tls_t *tls = nullptr;
@@ -636,10 +654,12 @@ class Tunnel {
         std::lock_guard<std::mutex> lock(handshakeMutex);
         edgeAddresses[index].clear();
     }
-    void run(unsigned attempt) {
+    const char *run(unsigned attempt) {
         std::unique_lock<std::mutex> handshake(handshakeMutex);
         const char *region = index % 2 ? "region2.v2.argotunnel.com" : "region1.v2.argotunnel.com";
-        const std::string host = chooseEdge(region, index, attempt);
+        std::string host;
+        if (const char *error = chooseEdge(region, index, attempt, host))
+            return error;
         edgeAddresses[index] = host;
         esp_tls_cfg_t cfg{};
         cfg.common_name = "h2.cftunnel.com";
@@ -649,26 +669,27 @@ class Tunnel {
         cfg.timeout_ms = 15000;
         tls = esp_tls_init();
         if (!tls)
-            throw std::bad_alloc();
+            return "Connection allocation failed";
         ESP_LOGI(TAG, "Connecting index=%u to %s:7844 with verified TLS", index, host.c_str());
         if (esp_tls_conn_new_sync(host.c_str(), host.size(), 7844, &cfg, tls) != 1)
-            throw std::runtime_error("TLS connect failed");
+            return "TLS connect failed";
         auto ssl = static_cast<mbedtls_ssl_context *>(esp_tls_get_ssl_context(tls));
         if (mbedtls_ssl_get_version_number(ssl) != MBEDTLS_SSL_VERSION_TLS1_3)
-            throw std::runtime_error("TLS 1.3 required");
+            return "TLS 1.3 required";
         ESP_LOGI(TAG, "Connection %u negotiated %s (%s)", index, mbedtls_ssl_get_version(ssl),
                  mbedtls_ssl_get_ciphersuite(ssl));
         const unsigned generation = wifiGeneration.load();
         handshake.unlock();
         int fd = -1;
-        ESP_ERROR_CHECK(esp_tls_get_conn_sockfd(tls, &fd));
+        if (esp_tls_get_conn_sockfd(tls, &fd) != ESP_OK)
+            return "TLS socket unavailable";
         if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0)
-            throw std::runtime_error("nonblocking socket setup failed");
+            return "nonblocking socket setup failed";
         int noDelay = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
         nghttp2_session_callbacks *cb = nullptr;
         if (nghttp2_session_callbacks_new(&cb))
-            throw std::bad_alloc();
+            return "Connection allocation failed";
         nghttp2_session_callbacks_set_data_source_read_length_callback(cb, frameLength);
         nghttp2_session_callbacks_set_on_begin_headers_callback(cb, beginHeaders);
         nghttp2_session_callbacks_set_on_header_callback(cb, header);
@@ -679,7 +700,7 @@ class Tunnel {
         nghttp2_option *options = nullptr;
         if (nghttp2_option_new(&options)) {
             nghttp2_session_callbacks_del(cb);
-            throw std::bad_alloc();
+            return "Connection allocation failed";
         }
         // Retaining closed streams for the legacy priority tree fragments the
         // ESP32 heap during sustained traffic. Only active streams need state.
@@ -689,7 +710,7 @@ class Tunnel {
         nghttp2_option_del(options);
         nghttp2_session_callbacks_del(cb);
         if (ret)
-            throw std::runtime_error("HTTP/2 initialization failed");
+            return "HTTP/2 initialization failed";
         nghttp2_settings_entry settings[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 64},
                                              {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 1024},
                                              {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, 8192}};
@@ -708,7 +729,7 @@ class Tunnel {
                     const uint8_t *out = nullptr;
                     ssize_t size = nghttp2_session_mem_send(h2, &out);
                     if (size < 0)
-                        throw std::runtime_error("HTTP/2 write failed");
+                        return "HTTP/2 write failed";
                     pending.clear();
                     written = 0;
                     if (!size)
@@ -721,7 +742,7 @@ class Tunnel {
                 if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE)
                     break;
                 if (n <= 0)
-                    throw std::runtime_error("TLS write failed");
+                    return "TLS write failed";
                 written += n;
                 budget -= std::min(budget, size_t(n));
                 progress = true;
@@ -737,20 +758,20 @@ class Tunnel {
                     progress = true;
                     ssize_t used = nghttp2_session_mem_recv(h2, in, n);
                     if (used < 0 || used != n)
-                        throw std::runtime_error("HTTP/2 receive failed");
+                        return "HTTP/2 receive failed";
                 } else if (n == 0)
-                    throw std::runtime_error("edge closed TLS");
+                    return "edge closed TLS";
                 else if (n != MBEDTLS_ERR_SSL_WANT_READ && n != MBEDTLS_ERR_SSL_WANT_WRITE &&
                          n != MBEDTLS_ERR_SSL_TIMEOUT)
-                    throw std::runtime_error("TLS read failed");
+                    return "TLS read failed";
             }
             if (written < pending.size() && esp_timer_get_time() - writeStarted > 15000000)
-                throw std::runtime_error("TLS write stalled");
+                return "TLS write stalled";
             int64_t now = esp_timer_get_time();
             if (!registered && now - began > 45000000)
-                throw std::runtime_error("registration timeout");
+                return "registration timeout";
             if (now - lastRx > 90000000)
-                throw std::runtime_error("edge heartbeat timeout");
+                return "edge heartbeat timeout";
             if (now - lastPing > 25000000) {
                 uint8_t ping[8]{};
                 memcpy(ping, &now, 8);
@@ -771,6 +792,7 @@ class Tunnel {
                 select(fd + 1, &readable, &writable, nullptr, &idle);
             }
         }
+        return failed ? "Peer or protocol closed connection" : "Wi-Fi connection changed";
     }
 };
 static void wifiEvent(void *, esp_event_base_t base, int32_t id, void *arg) {
@@ -801,7 +823,8 @@ static void tunnelWorker(void *arg) {
         int64_t started = esp_timer_get_time();
         try {
             Tunnel t(index);
-            t.run(attempt);
+            if (const char *error = t.run(attempt))
+                ESP_LOGW(TAG, "Connection %u ended: %s; retrying", index, error);
         } catch (const std::exception &e) {
             ESP_LOGW(TAG, "Connection %u ended: %s", index, e.what());
         }
